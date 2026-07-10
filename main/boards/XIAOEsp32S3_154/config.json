@@ -1,0 +1,9 @@
+{
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "XIAOEsp32S3_154",
+            "sdkconfig_append": []
+        }
+    ]
+}
