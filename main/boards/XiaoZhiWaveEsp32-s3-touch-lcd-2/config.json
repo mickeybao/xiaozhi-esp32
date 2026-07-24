@@ -6,7 +6,11 @@
             "name": "esp32-s3-touch-lcd-2",
             "sdkconfig_append": [
                 "CONFIG_USE_WECHAT_MESSAGE_STYLE=n",
-                "CONFIG_USE_DEVICE_AEC=y"
+                "CONFIG_USE_DEVICE_AEC=n",
+                "CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y",
+                "CONFIG_ESP_CONSOLE_UART_DEFAULT=n",
+                "CONFIG_ESP_CONSOLE_SECONDARY_NONE=y",
+                "CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=n"
             ]
         }
     ]

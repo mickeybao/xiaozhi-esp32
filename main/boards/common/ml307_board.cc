@@ -17,7 +17,8 @@ static constexpr int MODEM_DETECT_MAX_RETRIES = 30;
 // Maximum retry count for network registration
 static constexpr int NETWORK_REG_MAX_RETRIES = 6;
 
-Ml307Board::Ml307Board(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t dtr_pin) : tx_pin_(tx_pin), rx_pin_(rx_pin), dtr_pin_(dtr_pin) {
+Ml307Board::Ml307Board(gpio_num_t tx_pin, gpio_num_t rx_pin, gpio_num_t dtr_pin, int baud_rate)
+    : tx_pin_(tx_pin), rx_pin_(rx_pin), dtr_pin_(dtr_pin), baud_rate_(baud_rate) {
 }
 
 std::string Ml307Board::GetBoardType() {
@@ -71,7 +72,7 @@ void Ml307Board::NetworkTask() {
     // Try to detect modem with retry limit
     int detect_retries = 0;
     while (detect_retries < MODEM_DETECT_MAX_RETRIES) {
-        modem_ = AtModem::Detect(tx_pin_, rx_pin_, dtr_pin_, 921600);
+        modem_ = AtModem::Detect(tx_pin_, rx_pin_, dtr_pin_, baud_rate_);
         if (modem_ != nullptr) {
             break;
         }

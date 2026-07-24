@@ -23,6 +23,7 @@ private:
     gpio_num_t ml307_tx_pin_;
     gpio_num_t ml307_rx_pin_;
     gpio_num_t ml307_dtr_pin_;
+    int ml307_baud_rate_;
     
     // 从Settings加载网络类型
     NetworkType LoadNetworkTypeFromSettings(int32_t default_net_type);
@@ -34,7 +35,10 @@ private:
     void InitializeCurrentBoard();
  
 public:
-    DualNetworkBoard(gpio_num_t ml307_tx_pin, gpio_num_t ml307_rx_pin, gpio_num_t ml307_dtr_pin = GPIO_NUM_NC, int32_t default_net_type = 1);
+    DualNetworkBoard(gpio_num_t ml307_tx_pin, gpio_num_t ml307_rx_pin,
+                     gpio_num_t ml307_dtr_pin = GPIO_NUM_NC,
+                     int32_t default_net_type = 1,
+                     int ml307_baud_rate = 921600);
     virtual ~DualNetworkBoard() = default;
  
     // 切换网络类型
@@ -57,4 +61,4 @@ public:
     virtual std::string GetDeviceStatusJson() override;
 };
 
-#endif // DUAL_NETWORK_BOARD_H 
+#endif // DUAL_NETWORK_BOARD_H
