@@ -48,6 +48,13 @@
 #define DISPLAY_BACKLIGHT_PIN   GPIO_NUM_1
 #define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
 
+// Onboard VBAT monitor: GPIO5 sees one third of the battery voltage through
+// the 200K/100K divider (ESP32-S3 GPIO5 is ADC1 channel 4).
+#define BATTERY_ADC_UNIT        ADC_UNIT_1
+#define BATTERY_ADC_CHANNEL     ADC_CHANNEL_4
+#define BATTERY_UPPER_RESISTOR  200000
+#define BATTERY_LOWER_RESISTOR  100000
+
 // Header pin 3 (TXD/GPIO43) -> ML307R RXD
 // Header pin 4 (RXD/GPIO44) <- ML307R TXD
 #define ML307_TX_PIN            GPIO_NUM_43

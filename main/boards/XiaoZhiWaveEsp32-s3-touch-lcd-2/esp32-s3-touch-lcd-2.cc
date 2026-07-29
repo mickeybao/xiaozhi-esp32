@@ -7,6 +7,7 @@
 #include "mcp_server.h"
 #include "config.h"
 #include "power_save_timer.h"
+#include "adc_battery_monitor.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -26,6 +27,15 @@ private:
     Button boot_button_;
     Display* display_;
     PowerSaveTimer* power_save_timer_;
+    AdcBatteryMonitor* battery_monitor_;
+
+    void InitializeBatteryMonitor() {
+        battery_monitor_ = new AdcBatteryMonitor(
+            BATTERY_ADC_UNIT,
+            BATTERY_ADC_CHANNEL,
+            BATTERY_UPPER_RESISTOR,
+            BATTERY_LOWER_RESISTOR);
+    }
 
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
@@ -205,6 +215,7 @@ public:
                            DEFAULT_4G_NETWORK, ML307_BAUD_RATE),
           boot_button_(BOOT_BUTTON_GPIO) {
         InitializePowerSaveTimer();
+        InitializeBatteryMonitor();
         InitializeI2c();
         InitializeSpi();
         InitializeDisplay();
@@ -236,6 +247,13 @@ public:
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
+    }
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        level = battery_monitor_->GetBatteryLevel();
+        charging = battery_monitor_->IsCharging();
+        discharging = battery_monitor_->IsDischarging();
+        return true;
     }
 
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
