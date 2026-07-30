@@ -8,9 +8,12 @@
 #include "config.h"
 #include "power_save_timer.h"
 #include "adc_battery_monitor.h"
+#include "i2c_device.h"
+#include "assets/lang_config.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
+#include <esp_timer.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
 #include "settings.h"
@@ -18,8 +21,94 @@
 #include <esp_lcd_touch_cst816s.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+#include <algorithm>
+#include <array>
+#include <cstdio>
+#include <functional>
+#include <cmath>
+#include <memory>
+#include <string_view>
 
 #define TAG "WaveshareEsp32s3TouchLCD2inch"
+
+class Qmi8658 : public I2cDevice {
+public:
+    struct AccelData {
+        float x;
+        float y;
+        float z;
+    };
+
+    Qmi8658(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr), address_(addr) {}
+
+    bool Initialize() {
+        uint8_t who_am_i = 0;
+        if (!TryReadReg(QMI8658_REG_WHO_AM_I, who_am_i)) {
+            ESP_LOGW(TAG, "QMI8658 does not respond at 0x%02x", address_);
+            return false;
+        }
+        if (who_am_i != QMI8658_WHO_AM_I_VALUE) {
+            ESP_LOGW(TAG, "QMI8658 not found at 0x%02x, who_am_i=0x%02x", address_, who_am_i);
+            return false;
+        }
+
+        if (!TryWriteReg(QMI8658_REG_RESET, QMI8658_RESET_CMD)) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        if (!TryWriteReg(QMI8658_REG_CTRL1, QMI8658_CTRL1_AUTO_INCREMENT) ||
+            !TryWriteReg(QMI8658_REG_CTRL2, QMI8658_ACCEL_RANGE_4G | QMI8658_ACCEL_ODR_62_5HZ) ||
+            !TryWriteReg(QMI8658_REG_CTRL7, QMI8658_CTRL7_ACC_ENABLE)) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        ESP_LOGI(TAG, "QMI8658 initialized at 0x%02x", address_);
+        return true;
+    }
+
+    bool ReadAccel(AccelData& data) {
+        uint8_t status = 0;
+        if (!TryReadReg(QMI8658_REG_STATUS0, status)) {
+            return false;
+        }
+        if ((status & QMI8658_STATUS0_ACC_READY) == 0) {
+            return false;
+        }
+
+        uint8_t buffer[6] = {};
+        if (!TryReadRegs(QMI8658_REG_AX_L, buffer, sizeof(buffer))) {
+            return false;
+        }
+        int16_t raw_x = static_cast<int16_t>((buffer[1] << 8) | buffer[0]);
+        int16_t raw_y = static_cast<int16_t>((buffer[3] << 8) | buffer[2]);
+        int16_t raw_z = static_cast<int16_t>((buffer[5] << 8) | buffer[4]);
+
+        data.x = raw_x * ACCEL_4G_SCALE;
+        data.y = raw_y * ACCEL_4G_SCALE;
+        data.z = raw_z * ACCEL_4G_SCALE;
+        return true;
+    }
+
+private:
+    static constexpr uint8_t QMI8658_REG_WHO_AM_I = 0x00;
+    static constexpr uint8_t QMI8658_REG_CTRL1 = 0x02;
+    static constexpr uint8_t QMI8658_REG_CTRL2 = 0x03;
+    static constexpr uint8_t QMI8658_REG_CTRL7 = 0x08;
+    static constexpr uint8_t QMI8658_REG_STATUS0 = 0x2E;
+    static constexpr uint8_t QMI8658_REG_AX_L = 0x35;
+    static constexpr uint8_t QMI8658_REG_RESET = 0x60;
+    static constexpr uint8_t QMI8658_WHO_AM_I_VALUE = 0x05;
+    static constexpr uint8_t QMI8658_RESET_CMD = 0xB0;
+    static constexpr uint8_t QMI8658_CTRL1_AUTO_INCREMENT = 0x40;
+    static constexpr uint8_t QMI8658_ACCEL_RANGE_4G = 0x10;
+    static constexpr uint8_t QMI8658_ACCEL_ODR_62_5HZ = 0x07;
+    static constexpr uint8_t QMI8658_CTRL7_ACC_ENABLE = 0x01;
+    static constexpr uint8_t QMI8658_STATUS0_ACC_READY = 0x01;
+    static constexpr float ACCEL_4G_SCALE = 4.0f / 32768.0f;
+
+    uint8_t address_ = 0;
+};
 
 class WaveshareEsp32s3TouchLCD2inch : public DualNetworkBoard {
 private:
@@ -28,6 +117,95 @@ private:
     Display* display_;
     PowerSaveTimer* power_save_timer_;
     AdcBatteryMonitor* battery_monitor_;
+    std::unique_ptr<Qmi8658> imu_;
+    TaskHandle_t posture_task_handle_ = nullptr;
+    TaskHandle_t countdown_task_handle_ = nullptr;
+    bool countdown_armed_ = true;
+    int normal_z_sign_ = 0;
+
+    static const std::string_view& DigitSound(int digit) {
+        static const std::array<std::reference_wrapper<const std::string_view>, 10> sounds = {
+            std::cref(Lang::Sounds::OGG_0),
+            std::cref(Lang::Sounds::OGG_1),
+            std::cref(Lang::Sounds::OGG_2),
+            std::cref(Lang::Sounds::OGG_3),
+            std::cref(Lang::Sounds::OGG_4),
+            std::cref(Lang::Sounds::OGG_5),
+            std::cref(Lang::Sounds::OGG_6),
+            std::cref(Lang::Sounds::OGG_7),
+            std::cref(Lang::Sounds::OGG_8),
+            std::cref(Lang::Sounds::OGG_9),
+        };
+        return sounds[digit].get();
+    }
+
+    bool IsCountdownRunning() const {
+        return countdown_task_handle_ != nullptr;
+    }
+
+    void PlayCountdownNumber(int number) {
+        auto& app = Application::GetInstance();
+        if (number == 10) {
+            app.PlaySound(Lang::Sounds::OGG_1);
+            vTaskDelay(pdMS_TO_TICKS(180));
+            app.PlaySound(Lang::Sounds::OGG_0);
+            return;
+        }
+        if (number >= 0 && number <= 9) {
+            app.PlaySound(DigitSound(number));
+        }
+    }
+
+    void StartFlipCountdown() {
+        if (IsCountdownRunning()) {
+            return;
+        }
+
+        xTaskCreate([](void* arg) {
+            auto* self = static_cast<WaveshareEsp32s3TouchLCD2inch*>(arg);
+            auto& app = Application::GetInstance();
+            ESP_LOGI(TAG, "Starting flip countdown");
+
+            app.Schedule([&app]() {
+                auto state = app.GetDeviceState();
+                if (state == kDeviceStateSpeaking || state == kDeviceStateListening || state == kDeviceStateConnecting) {
+                    app.AbortSpeaking(kAbortReasonNone);
+                    app.SetDeviceState(kDeviceStateIdle);
+                }
+                app.GetAudioService().ResetDecoder();
+                auto display = Board::GetInstance().GetDisplay();
+                if (display != nullptr) {
+                    display->SetStatus("倒计时");
+                    display->SetChatMessage("system", "10");
+                }
+            });
+
+            vTaskDelay(pdMS_TO_TICKS(200));
+            for (int i = 10; i >= 1; --i) {
+                self->PlayCountdownNumber(i);
+                app.Schedule([i]() {
+                    auto display = Board::GetInstance().GetDisplay();
+                    if (display != nullptr) {
+                        char buffer[8];
+                        snprintf(buffer, sizeof(buffer), "%d", i);
+                        display->SetChatMessage("system", buffer);
+                    }
+                });
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+
+            app.Schedule([]() {
+                auto display = Board::GetInstance().GetDisplay();
+                if (display != nullptr) {
+                    display->SetChatMessage("system", "");
+                }
+            });
+
+            ESP_LOGI(TAG, "Flip countdown finished");
+            self->countdown_task_handle_ = nullptr;
+            vTaskDelete(nullptr);
+        }, "flip_countdown", 4096, this, 3, &countdown_task_handle_);
+    }
 
     void InitializeBatteryMonitor() {
         battery_monitor_ = new AdcBatteryMonitor(
@@ -59,6 +237,81 @@ private:
             },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
+    }
+
+    void InitializePostureDetector() {
+        for (uint8_t addr : {static_cast<uint8_t>(0x6A), static_cast<uint8_t>(0x6B)}) {
+            auto imu = std::make_unique<Qmi8658>(i2c_bus_, addr);
+            if (imu->Initialize()) {
+                imu_ = std::move(imu);
+                break;
+            }
+        }
+
+        if (!imu_) {
+            ESP_LOGW(TAG, "QMI8658 posture detector disabled");
+            return;
+        }
+
+        xTaskCreate([](void* arg) {
+            auto* self = static_cast<WaveshareEsp32s3TouchLCD2inch*>(arg);
+            int normal_samples = 0;
+            int flipped_samples = 0;
+            int restored_samples = 0;
+
+            while (true) {
+                Qmi8658::AccelData accel;
+                if (!self->imu_->ReadAccel(accel)) {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue;
+                }
+
+                if (self->normal_z_sign_ == 0) {
+                    if (std::fabs(accel.z) > 0.65f) {
+                        normal_samples++;
+                        if (normal_samples >= 20) {
+                            self->normal_z_sign_ = accel.z > 0 ? 1 : -1;
+                            ESP_LOGI(TAG, "Posture baseline set, z sign=%d, acc=(%.2f, %.2f, %.2f)",
+                                     self->normal_z_sign_, accel.x, accel.y, accel.z);
+                        }
+                    } else {
+                        normal_samples = 0;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue;
+                }
+
+                bool flipped = self->normal_z_sign_ > 0 ? accel.z < -0.75f : accel.z > 0.75f;
+                bool restored = self->normal_z_sign_ > 0 ? accel.z > 0.55f : accel.z < -0.55f;
+
+                if (flipped) {
+                    flipped_samples++;
+                    restored_samples = 0;
+                } else if (restored) {
+                    restored_samples++;
+                    flipped_samples = 0;
+                } else {
+                    flipped_samples = std::max(0, flipped_samples - 1);
+                    restored_samples = std::max(0, restored_samples - 1);
+                }
+
+                if (self->countdown_armed_ && flipped_samples >= 24) {
+                    auto state = Application::GetInstance().GetDeviceState();
+                    if (state != kDeviceStateStarting && state != kDeviceStateActivating &&
+                        state != kDeviceStateWifiConfiguring && state != kDeviceStateUpgrading) {
+                        self->countdown_armed_ = false;
+                        self->StartFlipCountdown();
+                    }
+                }
+
+                if (!self->countdown_armed_ && restored_samples >= 20) {
+                    ESP_LOGI(TAG, "Flip countdown re-armed");
+                    self->countdown_armed_ = true;
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        }, "posture", 4096, this, 3, &posture_task_handle_);
     }
 
     void InitializeSpi() {
@@ -217,6 +470,7 @@ public:
         InitializePowerSaveTimer();
         InitializeBatteryMonitor();
         InitializeI2c();
+        InitializePostureDetector();
         InitializeSpi();
         InitializeDisplay();
         InitializeTouch();

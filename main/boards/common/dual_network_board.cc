@@ -3,6 +3,7 @@
 #include "display.h"
 #include "assets/lang_config.h"
 #include "settings.h"
+#include "mcp_server.h"
 #include <esp_log.h>
 
 static const char *TAG = "DualNetworkBoard";
@@ -21,6 +22,7 @@ DualNetworkBoard::DualNetworkBoard(gpio_num_t ml307_tx_pin, gpio_num_t ml307_rx_
     
     // 只初始化当前网络类型对应的板卡
     InitializeCurrentBoard();
+    InitializeNetworkTools();
 }
 
 NetworkType DualNetworkBoard::LoadNetworkTypeFromSettings(int32_t default_net_type) {
@@ -46,15 +48,70 @@ void DualNetworkBoard::InitializeCurrentBoard() {
     }
 }
 
+void DualNetworkBoard::InitializeNetworkTools() {
+    auto& mcp_server = McpServer::GetInstance();
+    mcp_server.AddTool(
+        "self.network.set_type",
+        "Switch the device's active network between Wi-Fi and 4G. "
+        "Only call this tool when the user explicitly asks to switch networks. "
+        "The selection is saved and the device will reboot. "
+        "The `type` argument must be `wifi` or `4g`.",
+        PropertyList({
+            Property("type", kPropertyTypeString)
+        }),
+        [this](const PropertyList& properties) -> ReturnValue {
+            const auto type = properties["type"].value<std::string>();
+            NetworkType target_type;
+
+            if (type == "wifi") {
+                target_type = NetworkType::WIFI;
+            } else if (type == "4g") {
+                target_type = NetworkType::ML307;
+            } else {
+                throw std::invalid_argument("Network type must be `wifi` or `4g`");
+            }
+
+            if (target_type == network_type_) {
+                return target_type == NetworkType::WIFI
+                    ? std::string("Wi-Fi is already active")
+                    : std::string("4G is already active");
+            }
+
+            auto& app = Application::GetInstance();
+            app.Schedule([this, target_type]() {
+                SwitchNetworkType(target_type);
+            });
+
+            return target_type == NetworkType::WIFI
+                ? std::string("Switching to Wi-Fi; the device will reboot")
+                : std::string("Switching to 4G; the device will reboot");
+        });
+}
+
 void DualNetworkBoard::SwitchNetworkType() {
-    auto display = GetDisplay();
-    if (network_type_ == NetworkType::WIFI) {    
-        SaveNetworkTypeToSettings(NetworkType::ML307);
-        display->ShowNotification(Lang::Strings::SWITCH_TO_4G_NETWORK);
-    } else {
-        SaveNetworkTypeToSettings(NetworkType::WIFI);
-        display->ShowNotification(Lang::Strings::SWITCH_TO_WIFI_NETWORK);
+    const auto target_type = network_type_ == NetworkType::WIFI
+        ? NetworkType::ML307
+        : NetworkType::WIFI;
+    SwitchNetworkType(target_type);
+}
+
+void DualNetworkBoard::SwitchNetworkType(NetworkType target_type) {
+    if (target_type == network_type_) {
+        ESP_LOGI(TAG, "Network type is already %s",
+                 target_type == NetworkType::WIFI ? "WiFi" : "ML307");
+        return;
     }
+
+    network_type_ = target_type;
+    SaveNetworkTypeToSettings(target_type);
+
+    auto display = GetDisplay();
+    if (target_type == NetworkType::WIFI) {
+        display->ShowNotification(Lang::Strings::SWITCH_TO_WIFI_NETWORK);
+    } else {
+        display->ShowNotification(Lang::Strings::SWITCH_TO_4G_NETWORK);
+    }
+
     vTaskDelay(pdMS_TO_TICKS(1000));
     auto& app = Application::GetInstance();
     app.Reboot();

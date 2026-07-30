@@ -33,6 +33,9 @@ private:
 
     // 初始化当前网络类型对应的板卡
     void InitializeCurrentBoard();
+
+    // Register AI-visible tools for selecting the active network.
+    void InitializeNetworkTools();
  
 public:
     DualNetworkBoard(gpio_num_t ml307_tx_pin, gpio_num_t ml307_rx_pin,
@@ -43,6 +46,9 @@ public:
  
     // 切换网络类型
     void SwitchNetworkType();
+
+    // Switch to a specific network type. Does nothing if it is already active.
+    void SwitchNetworkType(NetworkType target_type);
     
     // 获取当前网络类型
     NetworkType GetNetworkType() const { return network_type_; }

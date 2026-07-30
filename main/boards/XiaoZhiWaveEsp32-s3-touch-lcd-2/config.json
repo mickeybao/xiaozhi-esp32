@@ -10,7 +10,11 @@
                 "CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y",
                 "CONFIG_ESP_CONSOLE_UART_DEFAULT=n",
                 "CONFIG_ESP_CONSOLE_SECONDARY_NONE=y",
-                "CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=n"
+                "CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=n",
+                "CONFIG_BOARD_TYPE_XIAOZHIWAVE_ESP32_S3_TOUCH_LCD_2=y",
+                "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/16m_6m_4m_assets.csv\"",
+                "CONFIG_OTA_URL=\"http://xz.atchain.cn:8080/ota/\""
             ]
         }
     ]
