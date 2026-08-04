@@ -38,6 +38,14 @@ def get_project_version() -> Optional[str]:
                 return line.split("\"")[1]
     return None
 
+def get_assets_version() -> Optional[str]:
+    """Read set(ASSETS_VER "x.y.z") from root CMakeLists.txt"""
+    with Path("CMakeLists.txt").open(encoding='utf-8') as f:
+        for line in f:
+            if line.startswith("set(ASSETS_VER"):
+                return line.split("\"")[1]
+    return None
+
 
 def merge_bin() -> None:
     if os.system("idf.py merge-bin") != 0:
@@ -46,16 +54,23 @@ def merge_bin() -> None:
 
 
 def zip_bin(name: str, version: str) -> None:
-    """Zip build/merged-binary.bin to releases/v{version}_{name}.zip"""
+    """Zip build/merged-binary.bin and optional assets bin to releases/v{version}_{name}.zip"""
     out_dir = Path("releases")
     out_dir.mkdir(exist_ok=True)
     output_path = out_dir / f"v{version}_{name}.zip"
+    assets_version = get_assets_version()
 
     if output_path.exists():
         output_path.unlink()
 
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
         zipf.write("build/merged-binary.bin", arcname="merged-binary.bin")
+        for assets_name in ("expression_assets.bin", "generated_assets.bin", "assets.bin"):
+            assets_path = Path("build") / assets_name
+            if assets_path.exists():
+                zipf.write(assets_path, arcname=assets_name)
+                print(f"include assets bin: {assets_path}, assets version: {assets_version}")
+                break
     print(f"zip bin to {output_path} done")
 
 def _get_manufacturer(cfg: dict) -> Optional[str]:

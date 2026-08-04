@@ -1,5 +1,6 @@
 #include "dual_network_board.h"
 #include "display/lcd_display.h"
+#include "display/emote_display.h"
 #include "audio/codecs/no_audio_codec.h"
 #include "application.h"
 #include "button.h"
@@ -23,6 +24,7 @@
 #include <lvgl.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <functional>
 #include <cmath>
@@ -110,18 +112,108 @@ private:
     uint8_t address_ = 0;
 };
 
+class MotionAwareSpiLcdDisplay : public SpiLcdDisplay {
+public:
+    using SpiLcdDisplay::SpiLcdDisplay;
+
+    void SetEmotionOffset(int16_t offset_x) {
+        DisplayLockGuard lock(this);
+        if (emoji_box_ != nullptr) {
+            lv_obj_set_style_translate_x(emoji_box_, offset_x, 0);
+        } else {
+            if (emoji_image_ != nullptr) {
+                lv_obj_set_style_translate_x(emoji_image_, offset_x, 0);
+            }
+            if (emoji_label_ != nullptr) {
+                lv_obj_set_style_translate_x(emoji_label_, offset_x, 0);
+            }
+        }
+    }
+};
+
+class MotionAwareEmoteDisplay : public emote::EmoteDisplay {
+public:
+    using emote::EmoteDisplay::EmoteDisplay;
+
+    void SetEmotionOffset(int16_t offset_x) {
+        auto handle = GetEmoteHandle();
+        if (handle == nullptr) {
+            return;
+        }
+
+        emote_lock(handle);
+        if (auto eye_anim = emote_get_obj_by_name(handle, "eye_anim")) {
+            gfx_obj_align(eye_anim, GFX_ALIGN_LEFT_MID, offset_x, 20);
+        }
+        if (auto emerg_dlg = emote_get_obj_by_name(handle, "emerg_dlg")) {
+            gfx_obj_align(emerg_dlg, GFX_ALIGN_LEFT_MID, offset_x, 20);
+        }
+        emote_unlock(handle);
+        RefreshAll();
+    }
+};
+
+class MotionAwareNoAudioCodecSimplex : public NoAudioCodecSimplex {
+public:
+    using NoAudioCodecSimplex::NoAudioCodecSimplex;
+
+    void SetMotionMuted(bool muted) {
+        motion_muted_ = muted;
+    }
+
+    virtual void OutputData(std::vector<int16_t>& data) override {
+        if (motion_muted_) {
+            return;
+        }
+        NoAudioCodecSimplex::OutputData(data);
+    }
+
+private:
+    std::atomic<bool> motion_muted_ = false;
+};
+
 class WaveshareEsp32s3TouchLCD2inch : public DualNetworkBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     Button boot_button_;
     Display* display_;
+    MotionAwareSpiLcdDisplay* motion_display_ = nullptr;
+    MotionAwareEmoteDisplay* motion_emote_display_ = nullptr;
     PowerSaveTimer* power_save_timer_;
     AdcBatteryMonitor* battery_monitor_;
     std::unique_ptr<Qmi8658> imu_;
     TaskHandle_t posture_task_handle_ = nullptr;
     TaskHandle_t countdown_task_handle_ = nullptr;
+    TaskHandle_t touch_task_handle_ = nullptr;
+    esp_timer_handle_t motion_emotion_reset_timer_ = nullptr;
     bool countdown_armed_ = true;
     int normal_z_sign_ = 0;
+    std::atomic<bool> motion_sleeping_ = false;
+    std::atomic<bool> face_down_muted_ = false;
+    std::atomic<bool> tilt_left_active_ = false;
+    std::atomic<bool> temporary_motion_emotion_ = false;
+
+    static constexpr const char* kAwakeEmotion = "surprised";
+    static constexpr const char* kSleepEmotion = "sleepy";
+    static constexpr const char* kShakeEmotion = "confused";
+    static constexpr const char* kDndEmotion = "relaxed";
+
+    void SetMotionEmotionOffset(int16_t offset_x) {
+        if (motion_display_ != nullptr) {
+            motion_display_->SetEmotionOffset(offset_x);
+        }
+        if (motion_emote_display_ != nullptr) {
+            motion_emote_display_->SetEmotionOffset(offset_x);
+        }
+    }
+
+    static void MotionEmotionResetTimerCallback(void* arg) {
+        auto* self = static_cast<WaveshareEsp32s3TouchLCD2inch*>(arg);
+        if (self != nullptr) {
+            self->temporary_motion_emotion_ = false;
+            self->ApplyPostureVisual();
+        }
+    }
 
     static const std::string_view& DigitSound(int digit) {
         static const std::array<std::reference_wrapper<const std::string_view>, 10> sounds = {
@@ -212,7 +304,9 @@ private:
             BATTERY_ADC_UNIT,
             BATTERY_ADC_CHANNEL,
             BATTERY_UPPER_RESISTOR,
-            BATTERY_LOWER_RESISTOR);
+            BATTERY_LOWER_RESISTOR,
+            GPIO_NUM_NC,
+            false);
     }
 
     void InitializePowerSaveTimer() {
@@ -224,6 +318,17 @@ private:
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness(); });
         power_save_timer_->SetEnabled(true);
+    }
+
+    void InitializeMotionFeedbackTimer() {
+        const esp_timer_create_args_t timer_args = {
+            .callback = &WaveshareEsp32s3TouchLCD2inch::MotionEmotionResetTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "motion_emoji",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &motion_emotion_reset_timer_));
     }
 
     void InitializeI2c() {
@@ -258,11 +363,28 @@ private:
             int normal_samples = 0;
             int flipped_samples = 0;
             int restored_samples = 0;
+            int still_flat_samples = 0;
+            int face_down_samples = 0;
+            int face_up_samples = 0;
+            Qmi8658::AccelData prev = {};
+            bool has_prev = false;
+            int64_t last_shake_ms = 0;
+            int64_t last_wake_ms = 0;
+
+            constexpr float kShakeDeltaThresholdG = 2.4f;
+            constexpr int64_t kShakeCooldownMs = 2000;
+            constexpr float kStillDeltaThresholdG = 0.08f;
+            constexpr float kWakeDeltaThresholdG = 0.28f;
+            constexpr float kFlatZThresholdG = 0.75f;
+            constexpr float kTiltLeftThresholdG = -0.45f;
+            constexpr int kStillFlatSamples = 75;
+            constexpr int kFaceDownSamples = 8;
+            constexpr int kFaceUpSamples = 8;
 
             while (true) {
                 Qmi8658::AccelData accel;
                 if (!self->imu_->ReadAccel(accel)) {
-                    vTaskDelay(pdMS_TO_TICKS(50));
+                    vTaskDelay(pdMS_TO_TICKS(80));
                     continue;
                 }
 
@@ -277,7 +399,9 @@ private:
                     } else {
                         normal_samples = 0;
                     }
-                    vTaskDelay(pdMS_TO_TICKS(50));
+                    prev = accel;
+                    has_prev = true;
+                    vTaskDelay(pdMS_TO_TICKS(80));
                     continue;
                 }
 
@@ -309,9 +433,208 @@ private:
                     self->countdown_armed_ = true;
                 }
 
-                vTaskDelay(pdMS_TO_TICKS(50));
+                float delta = 0.0f;
+                if (has_prev) {
+                    delta = std::fabs(accel.x - prev.x) + std::fabs(accel.y - prev.y) + std::fabs(accel.z - prev.z);
+                    int64_t now_ms = esp_timer_get_time() / 1000;
+                    if (delta > kShakeDeltaThresholdG && (now_ms - last_shake_ms) > kShakeCooldownMs) {
+                        last_shake_ms = now_ms;
+                        self->ShowDizzyFeedback();
+                    } else if (delta > kWakeDeltaThresholdG && (now_ms - last_wake_ms) > 1000) {
+                        last_wake_ms = now_ms;
+                        self->WakeFromMotion();
+                    }
+                }
+
+                bool face_down = self->normal_z_sign_ > 0 ? accel.z < -kFlatZThresholdG : accel.z > kFlatZThresholdG;
+                bool face_up = self->normal_z_sign_ > 0 ? accel.z > kFlatZThresholdG : accel.z < -kFlatZThresholdG;
+                bool flat_and_still = face_up && delta < kStillDeltaThresholdG;
+                bool tilt_left = accel.x < kTiltLeftThresholdG && std::fabs(accel.z) < 0.9f;
+
+                if (face_down) {
+                    face_down_samples++;
+                    face_up_samples = 0;
+                    still_flat_samples = 0;
+                } else if (face_up) {
+                    face_up_samples++;
+                    face_down_samples = 0;
+                    if (flat_and_still && !self->face_down_muted_ && !self->temporary_motion_emotion_) {
+                        still_flat_samples++;
+                    } else {
+                        still_flat_samples = 0;
+                    }
+                } else {
+                    face_down_samples = 0;
+                    face_up_samples = 0;
+                    still_flat_samples = 0;
+                }
+
+                if (face_down_samples >= kFaceDownSamples && !self->face_down_muted_) {
+                    self->SetFaceDownMuted(true);
+                }
+                if (face_up_samples >= kFaceUpSamples && self->face_down_muted_) {
+                    self->SetFaceDownMuted(false);
+                    self->WakeFromMotion();
+                }
+                if (still_flat_samples >= kStillFlatSamples && !self->motion_sleeping_) {
+                    self->EnterMotionSleep();
+                }
+                if (tilt_left != self->tilt_left_active_ && !self->face_down_muted_ && !self->temporary_motion_emotion_) {
+                    self->tilt_left_active_ = tilt_left;
+                    self->ApplyPostureVisual();
+                }
+
+                prev = accel;
+                has_prev = true;
+                vTaskDelay(pdMS_TO_TICKS(80));
             }
         }, "posture", 4096, this, 3, &posture_task_handle_);
+    }
+
+    void ApplyPostureVisual() {
+        auto& app = Application::GetInstance();
+        app.Schedule([this]() {
+            if (display_ == nullptr) {
+                return;
+            }
+
+            if (face_down_muted_) {
+                display_->SetStatus("免打扰");
+                display_->SetEmotion(kDndEmotion);
+                display_->SetChatMessage("system", "屏幕朝下，已静音");
+                SetMotionEmotionOffset(0);
+                return;
+            }
+
+            if (motion_sleeping_) {
+                display_->SetPowerSaveMode(true);
+                display_->SetEmotion(kSleepEmotion);
+                display_->SetChatMessage("system", "");
+                GetBacklight()->SetBrightness(12);
+                SetMotionEmotionOffset(0);
+                return;
+            }
+
+            display_->SetPowerSaveMode(false);
+            display_->SetEmotion(kAwakeEmotion);
+            display_->SetChatMessage("system", "");
+            SetMotionEmotionOffset(tilt_left_active_ ? -28 : 0);
+        });
+    }
+
+    void WakeFromMotion() {
+        motion_sleeping_ = false;
+        power_save_timer_->WakeUp();
+        auto& app = Application::GetInstance();
+        app.Schedule([this]() {
+            if (display_ != nullptr && !face_down_muted_) {
+                display_->SetPowerSaveMode(false);
+                display_->SetEmotion(kAwakeEmotion);
+                display_->SetChatMessage("system", "");
+                GetBacklight()->RestoreBrightness();
+                SetMotionEmotionOffset(tilt_left_active_ ? -28 : 0);
+            }
+        });
+    }
+
+    void EnterMotionSleep() {
+        auto state = Application::GetInstance().GetDeviceState();
+        if (state != kDeviceStateIdle) {
+            return;
+        }
+        ESP_LOGI(TAG, "Motion sleep: flat and still");
+        motion_sleeping_ = true;
+        ApplyPostureVisual();
+    }
+
+    void ShowDizzyFeedback() {
+        if (face_down_muted_) {
+            return;
+        }
+        ESP_LOGI(TAG, "Motion shake detected");
+        motion_sleeping_ = false;
+        temporary_motion_emotion_ = true;
+        power_save_timer_->WakeUp();
+
+        Application::GetInstance().Schedule([this]() {
+            auto& app = Application::GetInstance();
+            if (display_ != nullptr) {
+                display_->SetPowerSaveMode(false);
+                display_->SetEmotion(kShakeEmotion);
+                display_->SetChatMessage("system", "别摇啦");
+                GetBacklight()->RestoreBrightness();
+                SetMotionEmotionOffset(0);
+            }
+            app.PlaySound(Lang::Sounds::OGG_POPUP);
+        });
+
+        if (motion_emotion_reset_timer_ != nullptr) {
+            esp_timer_stop(motion_emotion_reset_timer_);
+            esp_timer_start_once(motion_emotion_reset_timer_, 1800 * 1000);
+        }
+    }
+
+    void SetFaceDownMuted(bool muted) {
+        face_down_muted_ = muted;
+        motion_sleeping_ = false;
+        Application::GetInstance().Schedule([this, muted]() {
+            auto& app = Application::GetInstance();
+            auto* codec = static_cast<MotionAwareNoAudioCodecSimplex*>(GetAudioCodec());
+            codec->SetMotionMuted(muted);
+
+            if (muted) {
+                app.GetAudioService().ResetDecoder();
+                if (display_ != nullptr) {
+                    display_->SetStatus("免打扰");
+                    display_->SetEmotion(kDndEmotion);
+                    display_->SetChatMessage("system", "屏幕朝下，已静音");
+                }
+                SetMotionEmotionOffset(0);
+            } else {
+                if (display_ != nullptr) {
+                    display_->SetStatus(Lang::Strings::STANDBY);
+                    display_->SetEmotion(kAwakeEmotion);
+                    display_->SetChatMessage("system", "");
+                    GetBacklight()->RestoreBrightness();
+                }
+                SetMotionEmotionOffset(tilt_left_active_ ? -28 : 0);
+            }
+        });
+    }
+
+    void StartTouchWakeTask(esp_lcd_touch_handle_t tp) {
+        if (touch_task_handle_ != nullptr) {
+            return;
+        }
+
+        xTaskCreate([](void* arg) {
+            auto* touch = static_cast<esp_lcd_touch_handle_t>(arg);
+            bool was_pressed = false;
+            int64_t last_click_ms = 0;
+
+            while (true) {
+                esp_lcd_touch_read_data(touch);
+
+                uint16_t x = 0;
+                uint16_t y = 0;
+                uint8_t point_count = 0;
+                bool pressed = esp_lcd_touch_get_coordinates(touch, &x, &y, nullptr, &point_count, 1);
+
+                if (pressed && point_count > 0 && !was_pressed) {
+                    int64_t now_ms = esp_timer_get_time() / 1000;
+                    if ((now_ms - last_click_ms) > 500) {
+                        last_click_ms = now_ms;
+                        ESP_LOGI(TAG, "Touch wake at x=%u, y=%u", x, y);
+                        auto& app = Application::GetInstance();
+                        app.Schedule([&app]() {
+                            app.ToggleChatState();
+                        });
+                    }
+                }
+                was_pressed = pressed && point_count > 0;
+                vTaskDelay(pdMS_TO_TICKS(40));
+            }
+        }, "touch_wake", 3072, tp, 3, &touch_task_handle_);
     }
 
     void InitializeSpi() {
@@ -382,10 +705,17 @@ private:
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, true);
-        // esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
+        esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         esp_lcd_panel_disp_on_off(panel, true);
-        display_ = new SpiLcdDisplay(panel_io, panel,
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        motion_emote_display_ = new MotionAwareEmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        display_ = motion_emote_display_;
+#else
+        motion_display_ = new MotionAwareSpiLcdDisplay(panel_io, panel,
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = motion_display_;
+#endif
     }
 
     void InitializeTouch() {
@@ -428,6 +758,11 @@ private:
             .disp = lv_display_get_default(),
             .handle = tp,
         };
+        if (touch_cfg.disp == nullptr) {
+            ESP_LOGW(TAG, "No LVGL display is registered; using touch wake task");
+            StartTouchWakeTask(tp);
+            return;
+        }
         lv_indev_t* touch_indev = lvgl_port_add_touch(&touch_cfg);
         ESP_ERROR_CHECK(touch_indev != nullptr ? ESP_OK : ESP_FAIL);
         lv_indev_add_event_cb(touch_indev, [](lv_event_t* event) {
@@ -468,6 +803,7 @@ public:
                            DEFAULT_4G_NETWORK, ML307_BAUD_RATE),
           boot_button_(BOOT_BUTTON_GPIO) {
         InitializePowerSaveTimer();
+        InitializeMotionFeedbackTimer();
         InitializeBatteryMonitor();
         InitializeI2c();
         InitializePostureDetector();
@@ -480,7 +816,7 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static NoAudioCodecSimplex audio_codec(
+        static MotionAwareNoAudioCodecSimplex audio_codec(
             AUDIO_INPUT_SAMPLE_RATE,
             AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_SPK_GPIO_BCLK,

@@ -185,6 +185,38 @@ esp_err_t Ota::CheckVersion() {
         ESP_LOGI(TAG, "No websocket section found!");
     }
 
+    cJSON *assets = cJSON_GetObjectItem(root, "assets");
+    if (cJSON_IsObject(assets)) {
+        cJSON *url = cJSON_GetObjectItem(assets, "url");
+        cJSON *version = cJSON_GetObjectItem(assets, "version");
+        cJSON *force = cJSON_GetObjectItem(assets, "force");
+
+        if (cJSON_IsString(url)) {
+            Settings settings("assets", true);
+            std::string assets_url = url->valuestring;
+            std::string assets_version = cJSON_IsString(version) ? version->valuestring : "";
+            bool force_update = cJSON_IsNumber(force) && force->valueint == 1;
+
+            std::string current_version = settings.GetString("version");
+            std::string current_url = settings.GetString("current_url");
+            bool version_changed = !assets_version.empty() && assets_version != current_version;
+            bool url_changed = assets_version.empty() && assets_url != current_url;
+
+            if (force_update || version_changed || url_changed) {
+                settings.SetString("download_url", assets_url);
+                settings.SetString("pending_url", assets_url);
+                if (!assets_version.empty()) {
+                    settings.SetString("pending_version", assets_version);
+                } else {
+                    settings.EraseKey("pending_version");
+                }
+                ESP_LOGI(TAG, "New assets available: %s", assets_url.c_str());
+            } else {
+                ESP_LOGI(TAG, "Assets are already up to date");
+            }
+        }
+    }
+
     has_server_time_ = false;
     cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
     if (cJSON_IsObject(server_time)) {

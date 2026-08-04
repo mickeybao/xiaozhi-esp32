@@ -8,7 +8,8 @@
 
 class AdcBatteryMonitor {
 public:
-    AdcBatteryMonitor(adc_unit_t adc_unit, adc_channel_t adc_channel, float upper_resistor, float lower_resistor, gpio_num_t charging_pin = GPIO_NUM_NC);
+    AdcBatteryMonitor(adc_unit_t adc_unit, adc_channel_t adc_channel, float upper_resistor, float lower_resistor,
+        gpio_num_t charging_pin = GPIO_NUM_NC, bool estimate_charging_when_no_pin = true);
     ~AdcBatteryMonitor();
 
     bool IsCharging();
@@ -19,6 +20,7 @@ public:
 
 private:
     gpio_num_t charging_pin_;
+    bool estimate_charging_when_no_pin_;
     adc_battery_estimation_handle_t adc_battery_estimation_handle_ = nullptr;
     esp_timer_handle_t timer_handle_ = nullptr;
     bool is_charging_ = false;

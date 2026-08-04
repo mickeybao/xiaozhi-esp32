@@ -324,11 +324,11 @@ void Application::ActivationTask() {
     // Create OTA object for activation process
     ota_ = std::make_unique<Ota>();
 
-    // Check for new assets version
-    CheckAssetsVersion();
-
     // Check for new firmware version
     CheckNewVersion();
+
+    // Check for new assets version
+    CheckAssetsVersion();
 
     // Initialize the protocol
     InitializeProtocol();
@@ -358,8 +358,6 @@ void Application::CheckAssetsVersion() {
     std::string download_url = settings.GetString("download_url");
 
     if (!download_url.empty()) {
-        settings.EraseKey("download_url");
-
         char message[256];
         snprintf(message, sizeof(message), Lang::Strings::FOUND_NEW_ASSETS, download_url.c_str());
         Alert(Lang::Strings::LOADING_ASSETS, message, "cloud_arrow_down", Lang::Sounds::OGG_UPGRADE);
@@ -387,6 +385,16 @@ void Application::CheckAssetsVersion() {
             SetDeviceState(kDeviceStateActivating);
             return;
         }
+
+        settings.EraseKey("download_url");
+        std::string pending_version = settings.GetString("pending_version");
+        std::string pending_url = settings.GetString("pending_url");
+        if (!pending_version.empty()) {
+            settings.SetString("version", pending_version);
+            settings.EraseKey("pending_version");
+        }
+        settings.SetString("current_url", pending_url.empty() ? download_url : pending_url);
+        settings.EraseKey("pending_url");
     }
 
     // Apply assets
@@ -975,7 +983,13 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 
     std::string upgrade_url = url;
     std::string version_info = version.empty() ? "(Manual upgrade)" : version;
+    auto state = GetDeviceState();
 
+    if (state == kDeviceStateSpeaking || state == kDeviceStateListening || state == kDeviceStateConnecting) {
+        AbortSpeaking(kAbortReasonNone);
+        audio_service_.ResetDecoder();
+        SetDeviceState(kDeviceStateIdle);
+    }
     // Close audio channel if it's open
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         ESP_LOGI(TAG, "Closing audio channel before firmware upgrade");

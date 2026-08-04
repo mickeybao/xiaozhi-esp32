@@ -410,6 +410,8 @@ elseif(CONFIG_BOARD_TYPE_XIAOZHIWAVE_ESP32_S3_TOUCH_LCD_2)
     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
     set(BUILTIN_ICON_FONT font_awesome_20_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+    set(EMOTE_RESOLUTION "240_320")
+    set(XIAOZHIWAVE_EMOTE_ASSETS_STAGING "${CMAKE_BINARY_DIR}/xiaozhiwave-emote-assets")
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_RGB_MATRIX)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-s3-rgb-matrix")
@@ -1153,6 +1155,172 @@ if(CONFIG_BOARD_TYPE_ESP_VOCAT)
     endif()
 endif()
 
+if(CONFIG_BOARD_TYPE_XIAOZHIWAVE_ESP32_S3_TOUCH_LCD_2 AND CONFIG_USE_EMOTE_MESSAGE_STYLE)
+    find_component_by_pattern("esp_emote_assets" EMOTE_ASSETS_COMPONENT EMOTE_ASSETS_PATH)
+    if(EMOTE_ASSETS_PATH)
+        file(REMOVE_RECURSE "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}")
+        file(REMOVE
+            "${CMAKE_BINARY_DIR}/expression_assets.bin"
+            "${CMAKE_BINARY_DIR}/expression_assets.bin.validated"
+        )
+        file(MAKE_DIRECTORY "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/240_320")
+        file(MAKE_DIRECTORY "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/wakenet")
+        file(MAKE_DIRECTORY "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/emoji_large")
+        file(COPY "${EMOTE_ASSETS_PATH}/emoji_large/" DESTINATION "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/emoji_large")
+        file(COPY "${EMOTE_ASSETS_PATH}/320_240/emote.json"
+                  "${EMOTE_ASSETS_PATH}/320_240/config.json"
+             DESTINATION "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/240_320")
+        set(XIAOZHIWAVE_SR_MODELS "${CMAKE_BINARY_DIR}/srmodels/srmodels.bin")
+        set(XIAOZHIWAVE_EMOTE_SR_MODELS "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/wakenet/srmodels.bin")
+        add_custom_command(
+            OUTPUT "${XIAOZHIWAVE_SR_MODELS}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/srmodels"
+            COMMAND python "${ESP_SR_COMPONENT_PATH}/model/movemodel.py"
+                    -d1 "${SDKCONFIG}"
+                    -d2 "${ESP_SR_COMPONENT_PATH}"
+                    -d3 "${CMAKE_BINARY_DIR}"
+            DEPENDS "${SDKCONFIG}"
+            COMMENT "Building selected wake words for XiaoZhiWave emote assets"
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT "${XIAOZHIWAVE_EMOTE_SR_MODELS}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${XIAOZHIWAVE_SR_MODELS}"
+                    "${XIAOZHIWAVE_EMOTE_SR_MODELS}"
+            DEPENDS "${XIAOZHIWAVE_SR_MODELS}"
+            COMMENT "Copying selected wake words into XiaoZhiWave emote assets"
+            VERBATIM
+        )
+        add_custom_target(xiaozhiwave_emote_wakenet DEPENDS "${XIAOZHIWAVE_EMOTE_SR_MODELS}")
+        file(WRITE "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/240_320/layout.json" [=[
+[
+  {
+    "type": "anim",
+    "name": "eye_anim",
+    "align": "GFX_ALIGN_LEFT_MID",
+    "x": 0,
+    "y": 20,
+    "anim": {
+      "mirror": "auto"
+    }
+  },
+  {
+    "type": "anim",
+    "name": "emerg_dlg",
+    "align": "GFX_ALIGN_LEFT_MID",
+    "x": 0,
+    "y": 20,
+    "anim": {
+      "mirror": "auto"
+    }
+  },
+  {
+    "type": "image",
+    "name": "status_icon",
+    "align": "GFX_ALIGN_TOP_MID",
+    "x": -105,
+    "y": 18
+  },
+  {
+    "type": "image",
+    "name": "charge_icon",
+    "align": "GFX_ALIGN_TOP_MID",
+    "x": -82,
+    "y": 28
+  },
+  {
+    "type": "label",
+    "name": "battery_label",
+    "align": "GFX_ALIGN_TOP_MID",
+    "x": -105,
+    "y": 31,
+    "width": 30,
+    "height": 20,
+    "label": {
+      "color": 16777215,
+      "text_align": "GFX_TEXT_ALIGN_CENTER",
+      "long_mode": {
+        "type": "GFX_LABEL_LONG_SCROLL",
+        "loop": true,
+        "speed": 10
+      }
+    }
+  },
+  {
+    "type": "label",
+    "name": "toast_label",
+    "align": "GFX_ALIGN_BOTTOM_MID",
+    "x": 0,
+    "y": -26,
+    "width": 220,
+    "height": 44,
+    "label": {
+      "color": 16777215,
+      "text_align": "GFX_TEXT_ALIGN_CENTER",
+      "long_mode": {
+        "type": "GFX_LABEL_LONG_SCROLL",
+        "loop": true,
+        "speed": 10
+      }
+    }
+  },
+  {
+    "type": "label",
+    "name": "clock_label",
+    "align": "GFX_ALIGN_TOP_MID",
+    "x": 0,
+    "y": 20,
+    "width": 90,
+    "height": 50,
+    "label": {
+      "color": 16777215,
+      "text_align": "GFX_TEXT_ALIGN_CENTER",
+      "long_mode": {
+        "type": "GFX_LABEL_LONG_CLIP"
+      }
+    }
+  },
+  {
+    "type": "anim",
+    "name": "listen_anim",
+    "align": "GFX_ALIGN_TOP_MID",
+    "x": 0,
+    "y": 5,
+    "anim": {
+      "mirror": "false"
+    }
+  },
+  {
+    "type": "timer",
+    "name": "clock_timer",
+    "timer": {
+      "period": 1000,
+      "repeat_count": -1
+    }
+  },
+  {
+    "type": "qrcode",
+    "name": "qrcode",
+    "align": "GFX_ALIGN_CENTER",
+    "x": 0,
+    "y": 35,
+    "qrcode": {
+      "size": 140
+    }
+  }
+]
+]=])
+        set(EMOTE_EXTERNAL_PATH "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${EMOTE_ASSETS_PATH}/320_240/emote.json"
+            "${EMOTE_ASSETS_PATH}/320_240/config.json"
+        )
+    else()
+        message(WARNING "esp_emote_assets component not found; XiaoZhiWave emote assets will be skipped")
+    endif()
+endif()
+
 if(CONFIG_BOARD_TYPE_ESP_HI)
 set(URL "https://github.com/espressif2022/image_player/raw/main/test_apps/test_8bit")
 set(EMOJI_DIR "${CMAKE_BINARY_DIR}/emoji")
@@ -1318,7 +1486,41 @@ if ("${size}" AND "${offset}")
         set(ASSETS_PARTITION "assets")
         set(ASSETS_FILE "${CMAKE_BINARY_DIR}/${ASSETS_NAME}.bin")
 
-        if(EMOTE_EXTERNAL_PATH)
+        if(CONFIG_BOARD_TYPE_XIAOZHIWAVE_ESP32_S3_TOUCH_LCD_2 AND CONFIG_USE_EMOTE_MESSAGE_STYLE
+                AND EMOTE_EXTERNAL_PATH AND XIAOZHIWAVE_EMOTE_SR_MODELS AND EMOTE_ASSETS_PATH)
+            add_custom_command(
+                OUTPUT ${ASSETS_FILE}
+                COMMAND python ${EMOTE_ASSETS_PATH}/scripts/spiffs_assets/build_all.py
+                        --resolution ${EMOTE_RESOLUTION}
+                        --output ${ASSETS_FILE}
+                        --name_length ${CONFIG_MMAP_FILE_NAME_LENGTH}
+                        --external_path "${EMOTE_EXTERNAL_PATH}"
+                DEPENDS
+                    ${EMOTE_ASSETS_PATH}/scripts/spiffs_assets/build_all.py
+                    "${XIAOZHIWAVE_EMOTE_SR_MODELS}"
+                    "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/240_320/config.json"
+                    "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/240_320/emote.json"
+                    "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/240_320/layout.json"
+                COMMENT "Building XiaoZhiWave emote_assets.bin based on selected wake words"
+                VERBATIM
+            )
+            add_custom_target(generated_speaker_assets ALL
+                DEPENDS ${ASSETS_FILE}
+            )
+            add_dependencies(flash generated_speaker_assets)
+
+            add_custom_command(
+                OUTPUT ${ASSETS_FILE}.validated
+                COMMAND ${CMAKE_COMMAND} -E echo "Validating speaker assets partition size..."
+                COMMAND ${CMAKE_COMMAND} -E touch ${ASSETS_FILE}.validated
+                DEPENDS ${ASSETS_FILE}
+                COMMENT "Validating speaker assets partition size"
+                VERBATIM
+            )
+            add_custom_target(validate_speaker_assets ALL
+                DEPENDS ${ASSETS_FILE}.validated
+            )
+        elseif(EMOTE_EXTERNAL_PATH)
             build_speaker_assets_bin("${ASSETS_PARTITION}" ${EMOTE_RESOLUTION} ${ASSETS_FILE} ${CONFIG_MMAP_FILE_NAME_LENGTH} "${EMOTE_EXTERNAL_PATH}")
         else()
             build_speaker_assets_bin("${ASSETS_PARTITION}" ${EMOTE_RESOLUTION} ${ASSETS_FILE} ${CONFIG_MMAP_FILE_NAME_LENGTH})

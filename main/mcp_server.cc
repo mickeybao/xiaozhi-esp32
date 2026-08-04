@@ -1,4 +1,4 @@
-/*
+﻿/*
  * MCP Server Implementation
  * Reference: https://modelcontextprotocol.io/specification/2024-11-05
  */
@@ -6,9 +6,13 @@
 #include "mcp_server.h"
 #include <esp_log.h>
 #include <esp_app_desc.h>
+#include <esp_timer.h>
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <esp_pthread.h>
+#include <memory>
+#include <mutex>
 
 #include "application.h"
 #include "display.h"
@@ -17,8 +21,206 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "ota.h"
+#include "assets/lang_config.h"
 
 #define TAG "MCP"
+
+namespace {
+
+class VoiceTimerManager {
+public:
+    static VoiceTimerManager& GetInstance() {
+        static VoiceTimerManager instance;
+        return instance;
+    }
+
+    std::string Start(int seconds) {
+        if (seconds <= 0) {
+            return "Invalid timer duration";
+        }
+
+        EnsureTimers();
+
+        if (seconds > kMaxDurationSeconds) {
+            seconds = kMaxDurationSeconds;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            active_ = true;
+            duration_seconds_ = seconds;
+            end_time_us_ = esp_timer_get_time() + static_cast<int64_t>(seconds) * kSecondUs;
+        }
+
+        esp_timer_stop(tick_timer_);
+        esp_timer_stop(restore_timer_);
+        ESP_ERROR_CHECK(esp_timer_start_periodic(tick_timer_, kSecondUs));
+        ShowCountdown(seconds);
+
+        return std::string("Timer started: ") + FormatRemaining(seconds);
+    }
+
+    std::string Cancel() {
+        bool was_active = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            was_active = active_;
+            active_ = false;
+        }
+
+        if (tick_timer_ != nullptr) {
+            esp_timer_stop(tick_timer_);
+        }
+        if (restore_timer_ != nullptr) {
+            esp_timer_stop(restore_timer_);
+        }
+
+        RestoreChat();
+        return was_active ? "Timer cancelled" : "No active timer";
+    }
+
+private:
+    static constexpr int kMaxDurationSeconds = 24 * 60 * 60;
+    static constexpr int64_t kSecondUs = 1000000;
+    static constexpr int64_t kRestoreDelayUs = 5 * kSecondUs;
+
+    std::mutex mutex_;
+    esp_timer_handle_t tick_timer_ = nullptr;
+    esp_timer_handle_t restore_timer_ = nullptr;
+    bool active_ = false;
+    int duration_seconds_ = 0;
+    int64_t end_time_us_ = 0;
+
+    VoiceTimerManager() = default;
+
+    void EnsureTimers() {
+        if (tick_timer_ == nullptr) {
+            esp_timer_create_args_t tick_args = {
+                .callback = &VoiceTimerManager::TickTimerCallback,
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "voice_timer_tick",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&tick_args, &tick_timer_));
+        }
+
+        if (restore_timer_ == nullptr) {
+            esp_timer_create_args_t restore_args = {
+                .callback = &VoiceTimerManager::RestoreTimerCallback,
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "voice_timer_done",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&restore_args, &restore_timer_));
+        }
+    }
+
+    static void TickTimerCallback(void* arg) {
+        static_cast<VoiceTimerManager*>(arg)->OnTick();
+    }
+
+    static void RestoreTimerCallback(void* arg) {
+        static_cast<VoiceTimerManager*>(arg)->RestoreChat();
+    }
+
+    void OnTick() {
+        int remaining_seconds = 0;
+        bool finished = false;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!active_) {
+                return;
+            }
+
+            int64_t remaining_us = end_time_us_ - esp_timer_get_time();
+            if (remaining_us <= 0) {
+                active_ = false;
+                finished = true;
+            } else {
+                remaining_seconds = static_cast<int>((remaining_us + kSecondUs - 1) / kSecondUs);
+            }
+        }
+
+        if (finished) {
+            esp_timer_stop(tick_timer_);
+            ShowFinished();
+            esp_timer_stop(restore_timer_);
+            ESP_ERROR_CHECK(esp_timer_start_once(restore_timer_, kRestoreDelayUs));
+            return;
+        }
+
+        ShowCountdown(remaining_seconds);
+    }
+
+    static std::string FormatRemaining(int seconds) {
+        int hours = seconds / 3600;
+        int minutes = (seconds % 3600) / 60;
+        int secs = seconds % 60;
+
+        char buffer[16];
+        if (hours > 0) {
+            snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", hours, minutes, secs);
+        } else {
+            snprintf(buffer, sizeof(buffer), "%02d:%02d", minutes, secs);
+        }
+        return buffer;
+    }
+
+    void ShowCountdown(int remaining_seconds) {
+        std::string time_text = FormatRemaining(remaining_seconds);
+        Application::GetInstance().Schedule([time_text]() {
+            static constexpr const char* kCountdownText = "\xE5\x80\x92\xE8\xAE\xA1\xE6\x97\xB6";
+            auto& board = Board::GetInstance();
+            if (auto backlight = board.GetBacklight()) {
+                backlight->RestoreBrightness();
+            }
+
+            auto display = board.GetDisplay();
+            if (display == nullptr) {
+                return;
+            }
+
+            display->SetPowerSaveMode(false);
+            display->SetStatus(kCountdownText);
+            display->SetEmotion("neutral");
+            std::string message = std::string(kCountdownText) + " " + time_text;
+            display->SetChatMessage("system", message.c_str());
+        });
+    }
+
+    void ShowFinished() {
+        Application::GetInstance().Schedule([]() {
+            static constexpr const char* kReminderText = "\xE6\x8F\x90\xE9\x86\x92";
+            static constexpr const char* kTimeUpText = "\xE6\x97\xB6\xE9\x97\xB4\xE5\x88\xB0\xE5\x95\xA6";
+            auto& app = Application::GetInstance();
+            auto& board = Board::GetInstance();
+            if (auto backlight = board.GetBacklight()) {
+                backlight->RestoreBrightness();
+            }
+
+            auto display = board.GetDisplay();
+            if (display != nullptr) {
+                display->SetPowerSaveMode(false);
+                display->SetStatus(kReminderText);
+                display->SetEmotion("surprised");
+                display->SetChatMessage("system", kTimeUpText);
+            }
+            app.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+        });
+    }
+
+    void RestoreChat() {
+        Application::GetInstance().Schedule([]() {
+            Application::GetInstance().DismissAlert();
+        });
+    }
+};
+
+} // namespace
 
 McpServer::McpServer() {
 }
@@ -33,7 +235,7 @@ McpServer::~McpServer() {
 void McpServer::AddCommonTools() {
     // *Important* To speed up the response time, we add the common tools to the beginning of
     // the tools list to utilize the prompt cache.
-    // **重要** 为了提升响应速度，我们把常用的工具放在前面，利用 prompt cache 的特性。
+    // **閲嶈** 涓轰簡鎻愬崌鍝嶅簲閫熷害锛屾垜浠妸甯哥敤鐨勫伐鍏锋斁鍦ㄥ墠闈紝鍒╃敤 prompt cache 鐨勭壒鎬с€?
 
     // Backup the original tools list and restore it after adding the common tools.
     auto original_tools = std::move(tools_);
@@ -60,6 +262,82 @@ void McpServer::AddCommonTools() {
         [&board](const PropertyList& properties) -> ReturnValue {
             auto codec = board.GetAudioCodec();
             codec->SetOutputVolume(properties["volume"].value<int>());
+            return true;
+        });
+
+    AddTool("self.timer.start",
+        "Start or replace a countdown timer on the device. Use this when the user asks for a timer, countdown, alarm after a duration, "
+        "voice timer, 定时提醒, 倒计时, or phrases like 定时1分钟 / 一分钟后提醒我. "
+        "Convert the requested duration to seconds before calling this tool. The screen shows the countdown; "
+        "when time is up, the device plays a reminder sound and returns to the chat screen.",
+        PropertyList({
+            Property("seconds", kPropertyTypeInteger, 1, 24 * 60 * 60)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            int seconds = properties["seconds"].value<int>();
+            return VoiceTimerManager::GetInstance().Start(seconds);
+        });
+
+    AddTool("self.timer.cancel",
+        "Cancel the active countdown timer. Use this when the user asks to cancel, stop, or clear the timer, 取消定时, 停止倒计时.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            return VoiceTimerManager::GetInstance().Cancel();
+        });
+
+    AddTool("self.system.check_and_upgrade_firmware",
+        "Check the configured OTA server for a newer firmware and install it if available. "
+        "Use this when the user asks to update, upgrade, OTA, check for a firmware update, 鍗囩骇鍥轰欢, 绯荤粺鍗囩骇, 妫€鏌ユ洿鏂? or OTA鍗囩骇 by voice. "
+        "This may download firmware and reboot the device, so you must ask the user to confirm before calling it.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            ESP_LOGW(TAG, "User requested OTA check and upgrade");
+
+            xTaskCreate([](void* arg) {
+                auto& app = Application::GetInstance();
+                auto display = Board::GetInstance().GetDisplay();
+
+                app.Schedule([display]() {
+                    display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
+                    display->SetChatMessage("system", Lang::Strings::CHECKING_NEW_VERSION);
+                });
+
+                Ota ota;
+                esp_err_t err = ota.CheckVersion();
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Voice OTA check failed: %s", esp_err_to_name(err));
+                    app.Schedule([display, err]() {
+                        char message[96];
+                        snprintf(message, sizeof(message), "OTA check failed: %s", esp_err_to_name(err));
+                        display->ShowNotification(message, 3000);
+                        display->SetChatMessage("system", message);
+                    });
+                    vTaskDelete(nullptr);
+                    return;
+                }
+
+                ota.MarkCurrentVersionValid();
+                if (!ota.HasNewVersion()) {
+                    std::string message = std::string("Already latest: ") + ota.GetCurrentVersion();
+                    app.Schedule([display, message]() {
+                        display->ShowNotification(message.c_str(), 3000);
+                        display->SetChatMessage("system", message.c_str());
+                    });
+                    vTaskDelete(nullptr);
+                    return;
+                }
+
+                auto firmware_url = ota.GetFirmwareUrl();
+                auto firmware_version = ota.GetFirmwareVersion();
+                bool success = app.UpgradeFirmware(firmware_url, firmware_version);
+                if (!success) {
+                    ESP_LOGE(TAG, "Voice OTA upgrade failed");
+                }
+                vTaskDelete(nullptr);
+            }, "voice_ota", 4096 * 2, nullptr, 2, nullptr);
+
             return true;
         });
     
@@ -156,14 +434,16 @@ void McpServer::AddUserOnlyTools() {
         [this](const PropertyList& properties) -> ReturnValue {
             auto url = properties["url"].value<std::string>();
             ESP_LOGI(TAG, "User requested firmware upgrade from URL: %s", url.c_str());
-            
-            auto& app = Application::GetInstance();
-            app.Schedule([url, &app]() {
-                bool success = app.UpgradeFirmware(url);
+
+            xTaskCreate([](void* arg) {
+                std::unique_ptr<std::string> url(static_cast<std::string*>(arg));
+                auto& app = Application::GetInstance();
+                bool success = app.UpgradeFirmware(*url);
                 if (!success) {
                     ESP_LOGE(TAG, "Firmware upgrade failed");
                 }
-            });
+                vTaskDelete(nullptr);
+            }, "manual_ota", 4096 * 2, new std::string(url), 2, nullptr);
             
             return true;
         });
@@ -203,7 +483,7 @@ void McpServer::AddUserOnlyTools() {
 
                 ESP_LOGI(TAG, "Upload snapshot %u bytes to %s", jpeg_data.size(), url.c_str());
                 
-                // 构造multipart/form-data请求体
+                // 鏋勯€爉ultipart/form-data璇锋眰浣?
                 std::string boundary = "----ESP32_SCREEN_SNAPSHOT_BOUNDARY";
                 
                 auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
@@ -212,7 +492,7 @@ void McpServer::AddUserOnlyTools() {
                     throw std::runtime_error("Failed to open URL: " + url);
                 }
                 {
-                    // 文件字段头部
+                    // 鏂囦欢瀛楁澶撮儴
                     std::string file_header;
                     file_header += "--" + boundary + "\r\n";
                     file_header += "Content-Disposition: form-data; name=\"file\"; filename=\"screenshot.jpg\"\r\n";
@@ -221,11 +501,11 @@ void McpServer::AddUserOnlyTools() {
                     http->Write(file_header.c_str(), file_header.size());
                 }
 
-                // JPEG数据
+                // JPEG鏁版嵁
                 http->Write((const char*)jpeg_data.data(), jpeg_data.size());
 
                 {
-                    // multipart尾部
+                    // multipart灏鹃儴
                     std::string multipart_footer;
                     multipart_footer += "\r\n--" + boundary + "--\r\n";
                     http->Write(multipart_footer.c_str(), multipart_footer.size());
@@ -284,7 +564,7 @@ void McpServer::AddUserOnlyTools() {
     }
 #endif // HAVE_LVGL
 
-    // Assets download url (always registered — Settings storage works regardless of partition layout)
+    // Assets download url (always registered 鈥?Settings storage works regardless of partition layout)
     AddUserOnlyTool("self.assets.set_download_url", "Set the download url for the assets",
             PropertyList({
                 Property("url", kPropertyTypeString)
@@ -458,7 +738,7 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
     std::string next_cursor = "";
     
     while (it != tools_.end()) {
-        // 如果我们还没有找到起始位置，继续搜索
+        // 濡傛灉鎴戜滑杩樻病鏈夋壘鍒拌捣濮嬩綅缃紝缁х画鎼滅储
         if (!found_cursor) {
             if ((*it)->name() == cursor) {
                 found_cursor = true;
@@ -473,10 +753,10 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
             continue;
         }
         
-        // 添加tool前检查大小
+        // 娣诲姞tool鍓嶆鏌ュぇ灏?
         std::string tool_json = (*it)->to_json() + ",";
         if (json.length() + tool_json.length() + 30 > max_payload_size) {
-            // 如果添加这个tool会超出大小限制，设置next_cursor并退出循环
+            // 濡傛灉娣诲姞杩欎釜tool浼氳秴鍑哄ぇ灏忛檺鍒讹紝璁剧疆next_cursor骞堕€€鍑哄惊鐜?
             next_cursor = (*it)->name();
             break;
         }
@@ -490,7 +770,7 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
     }
     
     if (json.back() == '[' && !tools_.empty()) {
-        // 如果没有添加任何tool，返回错误
+        // 濡傛灉娌℃湁娣诲姞浠讳綍tool锛岃繑鍥為敊璇?
         ESP_LOGE(TAG, "tools/list: Failed to add tool %s because of payload size limit", next_cursor.c_str());
         ReplyError(id, "Failed to add tool " + next_cursor + " because of payload size limit");
         return;

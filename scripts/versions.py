@@ -176,6 +176,20 @@ def upload_dir_to_oss(source_dir, target_dir):
         print('uploading', oss_key)
         bucket.put_object(oss_key, open(os.path.join(source_dir, filename), 'rb'))
 
+def find_assets_binary(dir_path):
+    for filename in ["expression_assets.bin", "generated_assets.bin", "assets.bin"]:
+        path = os.path.join(dir_path, filename)
+        if os.path.exists(path):
+            return filename
+    return None
+
+def get_assets_version():
+    with open("CMakeLists.txt", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("set(ASSETS_VER"):
+                return line.split("\"")[1]
+    return os.environ.get("ASSETS_VERSION", "1.0.0")
+
 def post_info_to_server(info):
     """
     将固件信息发送到服务器
@@ -236,6 +250,12 @@ def main():
                 target_dir = os.path.join("firmwares", tag)
                 info["tag"] = tag
                 info["url"] = os.path.join(os.environ['OSS_BUCKET_URL'], target_dir, "xiaozhi.bin")
+                assets_filename = find_assets_binary(folder)
+                if assets_filename is not None:
+                    info["assets"] = {
+                        "version": get_assets_version(),
+                        "url": os.path.join(os.environ['OSS_BUCKET_URL'], target_dir, assets_filename),
+                    }
                 open(info_path, "w", encoding="utf-8").write(json.dumps(info, indent=4))
                 # upload all file to oss
                 upload_dir_to_oss(folder, target_dir)
