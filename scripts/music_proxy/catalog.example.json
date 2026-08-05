@@ -1,0 +1,9 @@
+[
+  {
+    "id": "demo-1",
+    "name": "Demo Song",
+    "artist": "Replace Me",
+    "album": "Local Catalog",
+    "source_url": "https://example.com/path/to/song.mp3"
+  }
+]

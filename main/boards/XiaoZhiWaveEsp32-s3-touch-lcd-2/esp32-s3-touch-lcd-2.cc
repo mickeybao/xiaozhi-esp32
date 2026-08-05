@@ -183,10 +183,8 @@ private:
     AdcBatteryMonitor* battery_monitor_;
     std::unique_ptr<Qmi8658> imu_;
     TaskHandle_t posture_task_handle_ = nullptr;
-    TaskHandle_t countdown_task_handle_ = nullptr;
     TaskHandle_t touch_task_handle_ = nullptr;
     esp_timer_handle_t motion_emotion_reset_timer_ = nullptr;
-    bool countdown_armed_ = true;
     int normal_z_sign_ = 0;
     std::atomic<bool> motion_sleeping_ = false;
     std::atomic<bool> face_down_muted_ = false;
@@ -215,89 +213,6 @@ private:
         }
     }
 
-    static const std::string_view& DigitSound(int digit) {
-        static const std::array<std::reference_wrapper<const std::string_view>, 10> sounds = {
-            std::cref(Lang::Sounds::OGG_0),
-            std::cref(Lang::Sounds::OGG_1),
-            std::cref(Lang::Sounds::OGG_2),
-            std::cref(Lang::Sounds::OGG_3),
-            std::cref(Lang::Sounds::OGG_4),
-            std::cref(Lang::Sounds::OGG_5),
-            std::cref(Lang::Sounds::OGG_6),
-            std::cref(Lang::Sounds::OGG_7),
-            std::cref(Lang::Sounds::OGG_8),
-            std::cref(Lang::Sounds::OGG_9),
-        };
-        return sounds[digit].get();
-    }
-
-    bool IsCountdownRunning() const {
-        return countdown_task_handle_ != nullptr;
-    }
-
-    void PlayCountdownNumber(int number) {
-        auto& app = Application::GetInstance();
-        if (number == 10) {
-            app.PlaySound(Lang::Sounds::OGG_1);
-            vTaskDelay(pdMS_TO_TICKS(180));
-            app.PlaySound(Lang::Sounds::OGG_0);
-            return;
-        }
-        if (number >= 0 && number <= 9) {
-            app.PlaySound(DigitSound(number));
-        }
-    }
-
-    void StartFlipCountdown() {
-        if (IsCountdownRunning()) {
-            return;
-        }
-
-        xTaskCreate([](void* arg) {
-            auto* self = static_cast<WaveshareEsp32s3TouchLCD2inch*>(arg);
-            auto& app = Application::GetInstance();
-            ESP_LOGI(TAG, "Starting flip countdown");
-
-            app.Schedule([&app]() {
-                auto state = app.GetDeviceState();
-                if (state == kDeviceStateSpeaking || state == kDeviceStateListening || state == kDeviceStateConnecting) {
-                    app.AbortSpeaking(kAbortReasonNone);
-                    app.SetDeviceState(kDeviceStateIdle);
-                }
-                app.GetAudioService().ResetDecoder();
-                auto display = Board::GetInstance().GetDisplay();
-                if (display != nullptr) {
-                    display->SetStatus("倒计时");
-                    display->SetChatMessage("system", "10");
-                }
-            });
-
-            vTaskDelay(pdMS_TO_TICKS(200));
-            for (int i = 10; i >= 1; --i) {
-                self->PlayCountdownNumber(i);
-                app.Schedule([i]() {
-                    auto display = Board::GetInstance().GetDisplay();
-                    if (display != nullptr) {
-                        char buffer[8];
-                        snprintf(buffer, sizeof(buffer), "%d", i);
-                        display->SetChatMessage("system", buffer);
-                    }
-                });
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            }
-
-            app.Schedule([]() {
-                auto display = Board::GetInstance().GetDisplay();
-                if (display != nullptr) {
-                    display->SetChatMessage("system", "");
-                }
-            });
-
-            ESP_LOGI(TAG, "Flip countdown finished");
-            self->countdown_task_handle_ = nullptr;
-            vTaskDelete(nullptr);
-        }, "flip_countdown", 4096, this, 3, &countdown_task_handle_);
-    }
 
     void InitializeBatteryMonitor() {
         battery_monitor_ = new AdcBatteryMonitor(
@@ -361,8 +276,6 @@ private:
         xTaskCreate([](void* arg) {
             auto* self = static_cast<WaveshareEsp32s3TouchLCD2inch*>(arg);
             int normal_samples = 0;
-            int flipped_samples = 0;
-            int restored_samples = 0;
             int still_flat_samples = 0;
             int face_down_samples = 0;
             int face_up_samples = 0;
@@ -403,34 +316,6 @@ private:
                     has_prev = true;
                     vTaskDelay(pdMS_TO_TICKS(80));
                     continue;
-                }
-
-                bool flipped = self->normal_z_sign_ > 0 ? accel.z < -0.75f : accel.z > 0.75f;
-                bool restored = self->normal_z_sign_ > 0 ? accel.z > 0.55f : accel.z < -0.55f;
-
-                if (flipped) {
-                    flipped_samples++;
-                    restored_samples = 0;
-                } else if (restored) {
-                    restored_samples++;
-                    flipped_samples = 0;
-                } else {
-                    flipped_samples = std::max(0, flipped_samples - 1);
-                    restored_samples = std::max(0, restored_samples - 1);
-                }
-
-                if (self->countdown_armed_ && flipped_samples >= 24) {
-                    auto state = Application::GetInstance().GetDeviceState();
-                    if (state != kDeviceStateStarting && state != kDeviceStateActivating &&
-                        state != kDeviceStateWifiConfiguring && state != kDeviceStateUpgrading) {
-                        self->countdown_armed_ = false;
-                        self->StartFlipCountdown();
-                    }
-                }
-
-                if (!self->countdown_armed_ && restored_samples >= 20) {
-                    ESP_LOGI(TAG, "Flip countdown re-armed");
-                    self->countdown_armed_ = true;
                 }
 
                 float delta = 0.0f;
@@ -683,7 +568,7 @@ private:
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
 
-        // 液晶屏控制IO初始化
+        // 液晶屏控制 IO 初始化
         ESP_LOGD(TAG, "Install panel IO");
         esp_lcd_panel_io_spi_config_t io_config = {};
         io_config.cs_gpio_num = DISPLAY_CS_PIN;

@@ -104,26 +104,36 @@ void Application::Initialize() {
         
         switch (event) {
             case NetworkEvent::Scanning:
-                display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
+                display->SetEmotion("neutral");
+                display->SetStatus("搜索网络");
+                display->SetChatMessage("system", "正在搜索可用网络...");
+                display->ShowNotification(Lang::Strings::SCANNING_WIFI, 5000);
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
                 break;
             case NetworkEvent::Connecting: {
+                display->SetEmotion("thinking");
                 if (data.empty()) {
                     // Cellular network - registering without carrier info yet
                     display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
+                    display->SetChatMessage("system", "正在注册移动网络...");
                 } else {
                     // WiFi or cellular with carrier info
                     std::string msg = Lang::Strings::CONNECT_TO;
                     msg += data;
                     msg += "...";
-                    display->ShowNotification(msg.c_str(), 30000);
+                    display->SetStatus("联网中");
+                    display->SetChatMessage("system", msg.c_str());
+                    display->ShowNotification(msg.c_str(), 5000);
                 }
                 break;
             }
             case NetworkEvent::Connected: {
                 std::string msg = Lang::Strings::CONNECTED_TO;
                 msg += data;
-                display->ShowNotification(msg.c_str(), 30000);
+                display->SetEmotion("happy");
+                display->SetStatus("同步中");
+                display->SetChatMessage("system", "网络已连接，正在同步配置...");
+                display->ShowNotification(msg.c_str(), 2000);
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
                 break;
             }
@@ -324,11 +334,25 @@ void Application::ActivationTask() {
     // Create OTA object for activation process
     ota_ = std::make_unique<Ota>();
 
+    Schedule([]() {
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetEmotion("thinking");
+        display->SetStatus("检查更新");
+        display->SetChatMessage("system", "正在检查固件和表情资源...");
+    });
+
     // Check for new firmware version
     CheckNewVersion();
 
     // Check for new assets version
     CheckAssetsVersion();
+
+    Schedule([]() {
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetEmotion("neutral");
+        display->SetStatus("准备连接");
+        display->SetChatMessage("system", "正在准备语音服务...");
+    });
 
     // Initialize the protocol
     InitializeProtocol();

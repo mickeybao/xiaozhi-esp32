@@ -18,6 +18,8 @@ private:
     // 使用基类指针存储当前活动的板卡
     std::unique_ptr<Board> current_board_;
     NetworkType network_type_ = NetworkType::ML307;  // Default to ML307
+    NetworkEventCallback network_event_callback_;
+    bool fallback_to_wifi_scheduled_ = false;
 
     // ML307的引脚配置
     gpio_num_t ml307_tx_pin_;
@@ -33,6 +35,8 @@ private:
 
     // 初始化当前网络类型对应的板卡
     void InitializeCurrentBoard();
+    void OnNetworkEvent(NetworkEvent event, const std::string& data);
+    void FallbackToWifiAfter4GError(NetworkEvent event);
 
     // Register AI-visible tools for selecting the active network.
     void InitializeNetworkTools();

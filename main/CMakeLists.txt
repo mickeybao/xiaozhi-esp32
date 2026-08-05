@@ -1167,6 +1167,8 @@ if(CONFIG_BOARD_TYPE_XIAOZHIWAVE_ESP32_S3_TOUCH_LCD_2 AND CONFIG_USE_EMOTE_MESSA
         file(MAKE_DIRECTORY "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/wakenet")
         file(MAKE_DIRECTORY "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/emoji_large")
         file(COPY "${EMOTE_ASSETS_PATH}/emoji_large/" DESTINATION "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/emoji_large")
+        file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/boards/XiaoZhiWaveEsp32-s3-touch-lcd-2/emote_icons/"
+             DESTINATION "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/emoji_large")
         file(COPY "${EMOTE_ASSETS_PATH}/320_240/emote.json"
                   "${EMOTE_ASSETS_PATH}/320_240/config.json"
              DESTINATION "${XIAOZHIWAVE_EMOTE_ASSETS_STAGING}/240_320")
@@ -1223,20 +1225,36 @@ if(CONFIG_BOARD_TYPE_XIAOZHIWAVE_ESP32_S3_TOUCH_LCD_2 AND CONFIG_USE_EMOTE_MESSA
     "y": 18
   },
   {
+    "type": "label",
+    "name": "network_label",
+    "align": "GFX_ALIGN_TOP_MID",
+    "x": -68,
+    "y": 20,
+    "width": 52,
+    "height": 24,
+    "label": {
+      "color": 16777215,
+      "text_align": "GFX_TEXT_ALIGN_LEFT",
+      "long_mode": {
+        "type": "GFX_LABEL_LONG_CLIP"
+      }
+    }
+  },
+  {
     "type": "image",
     "name": "charge_icon",
     "align": "GFX_ALIGN_TOP_MID",
-    "x": -82,
+    "x": 92,
     "y": 28
   },
   {
     "type": "label",
     "name": "battery_label",
     "align": "GFX_ALIGN_TOP_MID",
-    "x": -105,
-    "y": 31,
-    "width": 30,
-    "height": 20,
+    "x": 91,
+    "y": 20,
+    "width": 58,
+    "height": 24,
     "label": {
       "color": 16777215,
       "text_align": "GFX_TEXT_ALIGN_CENTER",

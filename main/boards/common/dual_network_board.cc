@@ -5,6 +5,8 @@
 #include "settings.h"
 #include "mcp_server.h"
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 static const char *TAG = "DualNetworkBoard";
 
@@ -46,6 +48,63 @@ void DualNetworkBoard::InitializeCurrentBoard() {
         ESP_LOGI(TAG, "Initialize WiFi board");
         current_board_ = std::make_unique<WifiBoard>();
     }
+}
+
+void DualNetworkBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
+    if (network_type_ == NetworkType::ML307) {
+        switch (event) {
+            case NetworkEvent::ModemErrorNoSim:
+            case NetworkEvent::ModemErrorRegDenied:
+            case NetworkEvent::ModemErrorInitFailed:
+            case NetworkEvent::ModemErrorTimeout:
+                FallbackToWifiAfter4GError(event);
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (network_event_callback_) {
+        network_event_callback_(event, data);
+    }
+}
+
+void DualNetworkBoard::FallbackToWifiAfter4GError(NetworkEvent event) {
+    if (fallback_to_wifi_scheduled_) {
+        return;
+    }
+    fallback_to_wifi_scheduled_ = true;
+
+    const char* reason = "4G unavailable";
+    switch (event) {
+        case NetworkEvent::ModemErrorNoSim:
+            reason = "No SIM card";
+            break;
+        case NetworkEvent::ModemErrorRegDenied:
+            reason = "4G registration denied";
+            break;
+        case NetworkEvent::ModemErrorInitFailed:
+            reason = "4G module not detected";
+            break;
+        case NetworkEvent::ModemErrorTimeout:
+            reason = "4G registration timeout";
+            break;
+        default:
+            break;
+    }
+
+    ESP_LOGW(TAG, "%s, fallback to WiFi", reason);
+    SaveNetworkTypeToSettings(NetworkType::WIFI);
+
+    auto display = GetDisplay();
+    if (display != nullptr) {
+        display->ShowNotification("4G不可用，切回WiFi", 3000);
+        display->SetStatus("切回WiFi");
+        display->SetChatMessage("system", "4G模组未响应，正在切回WiFi...");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    Application::GetInstance().Reboot();
 }
 
 void DualNetworkBoard::InitializeNetworkTools() {
@@ -134,8 +193,10 @@ void DualNetworkBoard::StartNetwork() {
 }
 
 void DualNetworkBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
-    // Forward the callback to the current board
-    current_board_->SetNetworkEventCallback(std::move(callback));
+    network_event_callback_ = std::move(callback);
+    current_board_->SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
+        OnNetworkEvent(event, data);
+    });
 }
 
 NetworkInterface* DualNetworkBoard::GetNetwork() {

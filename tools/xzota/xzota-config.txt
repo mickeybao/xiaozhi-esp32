@@ -1,0 +1,17 @@
+﻿# Xiaozhi OTA proxy config
+# FIRMWARE_*/ASSETS_* 配置会在每次请求时重新读取，修改后无需重启服务。
+# 只有 PORT 变更需要重启 node xzota.js，因为监听端口在启动时绑定。
+
+PORT=8081
+ENABLE_FIRMWARE_UPGRADE=1
+FIRMWARE_VERSION=2.2.18
+FIRMWARE_FILE=C:\website\xz\xiaozhi.bin
+FIRMWARE_URL=http://xz.atchain.cn/xiaozhi.bin
+
+# Optional assets partition OTA.
+# When enabled, /ota/ will include an assets section, and this proxy can serve the bin file.
+# Keep this as an independent numeric version so assets can update only when assets changed.
+ENABLE_ASSETS_UPGRADE=1
+ASSETS_VERSION=1.0.8
+ASSETS_FILE=C:\website\xz\expression_assets.bin
+ASSETS_URL=http://xz.atchain.cn/expression_assets.bin

@@ -10,9 +10,12 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <esp_pthread.h>
 #include <memory>
 #include <mutex>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include "application.h"
 #include "display.h"
@@ -22,11 +25,24 @@
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
 #include "ota.h"
+#include "audio/demuxer/ogg_demuxer.h"
+#include "protocols/protocol.h"
 #include "assets/lang_config.h"
 
 #define TAG "MCP"
 
 namespace {
+
+void PlayVoiceTimerAlarmTask(void*) {
+    auto& app = Application::GetInstance();
+    for (int i = 0; i < 9; ++i) {
+        app.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+        if (i < 8) {
+            vTaskDelay(pdMS_TO_TICKS(450));
+        }
+    }
+    vTaskDelete(nullptr);
+}
 
 class VoiceTimerManager {
 public:
@@ -209,7 +225,7 @@ private:
                 display->SetEmotion("surprised");
                 display->SetChatMessage("system", kTimeUpText);
             }
-            app.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+            xTaskCreate(PlayVoiceTimerAlarmTask, "voice_timer_alarm", 2048, nullptr, 3, nullptr);
         });
     }
 
@@ -217,6 +233,331 @@ private:
         Application::GetInstance().Schedule([]() {
             Application::GetInstance().DismissAlert();
         });
+    }
+};
+
+class RadioStreamManager {
+public:
+    static RadioStreamManager& GetInstance() {
+        static RadioStreamManager instance;
+        return instance;
+    }
+
+    std::string Start(const std::string& url, const std::string& name) {
+        std::string stream_url = url;
+        std::string station_name = name.empty() ? "网络收音机" : name;
+        if (stream_url.empty()) {
+            auto resolved = ResolveStationUrl(station_name);
+            if (resolved.empty()) {
+                return "没有找到可直接播放的 Ogg Opus 电台。可以换一个电台名称，或在后台把 MP3/AAC 电台转码成 Ogg Opus。";
+            }
+            stream_url = resolved;
+        }
+        if (stream_url.rfind("http://", 0) != 0 && stream_url.rfind("https://", 0) != 0) {
+            return "网络收音机 URL 必须以 http:// 或 https:// 开头";
+        }
+
+        Stop();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stream_id_++;
+            url_ = stream_url;
+            name_ = station_name;
+            stop_requested_ = false;
+        }
+
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetEmotion("happy");
+        display->SetStatus("收音机");
+        display->SetChatMessage("system", ("正在播放 " + name_).c_str());
+
+        BaseType_t ok = xTaskCreate([](void* arg) {
+            static_cast<RadioStreamManager*>(arg)->StreamTask();
+            vTaskDelete(nullptr);
+        }, "radio_stream", 4096 * 4, this, 2, &task_handle_);
+
+        if (ok != pdPASS) {
+            task_handle_ = nullptr;
+            return "启动网络收音机任务失败";
+        }
+        return "Radio started";
+    }
+
+    std::string Stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_requested_ = true;
+        }
+        Application::GetInstance().GetAudioService().ResetDecoder();
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetChatMessage("system", "网络收音机已停止");
+        display->SetStatus(Lang::Strings::STANDBY);
+        return "Radio stopped";
+    }
+
+    std::string List(const std::string& name, const std::string& country,
+                     const std::string& language, const std::string& tag) {
+        return ListStations(name, country, language, tag);
+    }
+
+private:
+    std::mutex mutex_;
+    TaskHandle_t task_handle_ = nullptr;
+    bool stop_requested_ = false;
+    uint32_t stream_id_ = 0;
+    std::string url_;
+    std::string name_;
+
+    RadioStreamManager() = default;
+
+    std::string UrlEncode(const std::string& value) {
+        static const char hex[] = "0123456789ABCDEF";
+        std::string encoded;
+        encoded.reserve(value.size() * 3);
+        for (unsigned char c : value) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+                encoded.push_back(static_cast<char>(c));
+            } else if (c == ' ') {
+                encoded.push_back('+');
+            } else {
+                encoded.push_back('%');
+                encoded.push_back(hex[c >> 4]);
+                encoded.push_back(hex[c & 0x0F]);
+            }
+        }
+        return encoded;
+    }
+
+    bool SameTextIgnoreCase(const char* left, const char* right) {
+        if (left == nullptr || right == nullptr) {
+            return false;
+        }
+        while (*left != '\0' && *right != '\0') {
+            if (std::tolower(static_cast<unsigned char>(*left)) !=
+                std::tolower(static_cast<unsigned char>(*right))) {
+                return false;
+            }
+            left++;
+            right++;
+        }
+        return *left == '\0' && *right == '\0';
+    }
+
+    std::string ResolveStationUrl(const std::string& name) {
+        std::string api_url = BuildStationSearchUrl(name, "", "", "", 8, name.empty() || name == "网络收音机");
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+        http->SetTimeout(8000);
+        http->SetHeader("User-Agent", "XiaoZhiWave/2.2.16");
+        http->SetHeader("Accept", "application/json");
+        if (!http->Open("GET", api_url)) {
+            return "";
+        }
+        if (http->GetStatusCode() < 200 || http->GetStatusCode() >= 300) {
+            http->Close();
+            return "";
+        }
+
+        std::string body = http->ReadAll();
+        http->Close();
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (!cJSON_IsArray(root)) {
+            if (root != nullptr) {
+                cJSON_Delete(root);
+            }
+            return "";
+        }
+
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, root) {
+            const cJSON* codec = cJSON_GetObjectItem(item, "codec");
+            const cJSON* url_resolved = cJSON_GetObjectItem(item, "url_resolved");
+            const cJSON* raw_url = cJSON_GetObjectItem(item, "url");
+            const char* candidate = cJSON_IsString(url_resolved) && url_resolved->valuestring[0] != '\0'
+                ? url_resolved->valuestring
+                : (cJSON_IsString(raw_url) ? raw_url->valuestring : "");
+            if (candidate == nullptr || candidate[0] == '\0') {
+                continue;
+            }
+            if (cJSON_IsString(codec) &&
+                (SameTextIgnoreCase(codec->valuestring, "OPUS") || SameTextIgnoreCase(codec->valuestring, "OGG"))) {
+                std::string result = candidate;
+                cJSON_Delete(root);
+                return result;
+            }
+        }
+
+        cJSON_Delete(root);
+        return "";
+    }
+
+    std::string BuildStationSearchUrl(const std::string& name, const std::string& country,
+                                      const std::string& language, const std::string& tag,
+                                      int limit, bool random) {
+        std::string api_url = "https://de1.api.radio-browser.info/json/stations/search?hidebroken=true&limit=" +
+            std::to_string(limit);
+        if (random) {
+            api_url += "&order=random";
+        } else {
+            api_url += "&order=clickcount&reverse=true";
+        }
+        api_url += "&codec=OPUS";
+        if (!name.empty() && name != "网络收音机") {
+            api_url += "&name=" + UrlEncode(name);
+        }
+        if (!country.empty()) {
+            api_url += "&country=" + UrlEncode(country);
+        }
+        if (!language.empty()) {
+            api_url += "&language=" + UrlEncode(language);
+        }
+        if (!tag.empty()) {
+            api_url += "&tag=" + UrlEncode(tag);
+        }
+        return api_url;
+    }
+
+    std::string ListStations(const std::string& name, const std::string& country,
+                             const std::string& language, const std::string& tag) {
+        std::string api_url = BuildStationSearchUrl(name, country, language, tag, 6, name.empty() && country.empty() && language.empty() && tag.empty());
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+        http->SetTimeout(8000);
+        http->SetHeader("User-Agent", "XiaoZhiWave/2.2.16");
+        http->SetHeader("Accept", "application/json");
+        if (!http->Open("GET", api_url)) {
+            return "查询电台目录失败";
+        }
+        if (http->GetStatusCode() < 200 || http->GetStatusCode() >= 300) {
+            http->Close();
+            return "电台目录响应异常";
+        }
+
+        std::string body = http->ReadAll();
+        http->Close();
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (!cJSON_IsArray(root)) {
+            if (root != nullptr) {
+                cJSON_Delete(root);
+            }
+            return "电台目录数据解析失败";
+        }
+
+        std::string result = "可直接播放的 Ogg Opus 电台：";
+        int count = 0;
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, root) {
+            const cJSON* station_name = cJSON_GetObjectItem(item, "name");
+            const cJSON* station_country = cJSON_GetObjectItem(item, "country");
+            const cJSON* codec = cJSON_GetObjectItem(item, "codec");
+            const cJSON* bitrate = cJSON_GetObjectItem(item, "bitrate");
+            if (!cJSON_IsString(station_name) || station_name->valuestring[0] == '\0') {
+                continue;
+            }
+            result += "\n";
+            result += std::to_string(count + 1);
+            result += ". ";
+            result += station_name->valuestring;
+            if (cJSON_IsString(station_country) && station_country->valuestring[0] != '\0') {
+                result += " / ";
+                result += station_country->valuestring;
+            }
+            if (cJSON_IsString(codec)) {
+                result += " / ";
+                result += codec->valuestring;
+            }
+            if (cJSON_IsNumber(bitrate) && bitrate->valueint > 0) {
+                result += " / ";
+                result += std::to_string(bitrate->valueint);
+                result += "kbps";
+            }
+            count++;
+        }
+        cJSON_Delete(root);
+
+        if (count == 0) {
+            return "没有找到可直接播放的 Ogg Opus 电台。可以换关键词，或使用后台转码 MP3/AAC 电台。";
+        }
+        result += "\n你可以说：播放第一个，或播放上面某个电台名。";
+        return result;
+    }
+
+    bool ShouldStop(uint32_t stream_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stop_requested_ || stream_id != stream_id_;
+    }
+
+    void StreamTask() {
+        std::string url;
+        std::string name;
+        uint32_t stream_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            url = url_;
+            name = name_;
+            stream_id = stream_id_;
+        }
+
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+        http->SetTimeout(20000);
+        http->SetHeader("Accept", "audio/ogg, application/ogg, audio/opus, */*");
+        if (!http->Open("GET", url)) {
+            ShowError("电台连接失败");
+            MarkStopped(stream_id);
+            return;
+        }
+
+        int status_code = http->GetStatusCode();
+        if (status_code < 200 || status_code >= 300) {
+            http->Close();
+            ShowError("电台响应异常");
+            MarkStopped(stream_id);
+            return;
+        }
+
+        auto& audio_service = Application::GetInstance().GetAudioService();
+        auto demuxer = std::make_unique<OggDemuxer>();
+        demuxer->OnDemuxerFinished([&audio_service](const uint8_t* data, int sample_rate, size_t size) {
+            auto packet = std::make_unique<AudioStreamPacket>();
+            packet->sample_rate = sample_rate;
+            packet->frame_duration = 60;
+            packet->payload.resize(size);
+            std::memcpy(packet->payload.data(), data, size);
+            audio_service.PushPacketToDecodeQueue(std::move(packet), true);
+        });
+        demuxer->Reset();
+
+        char buffer[1024];
+        while (!ShouldStop(stream_id)) {
+            int ret = http->Read(buffer, sizeof(buffer));
+            if (ret < 0) {
+                ShowError("电台读取失败");
+                break;
+            }
+            if (ret == 0) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            demuxer->Process(reinterpret_cast<const uint8_t*>(buffer), ret);
+        }
+
+        http->Close();
+        MarkStopped(stream_id);
+    }
+
+    void ShowError(const char* message) {
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetEmotion("confused");
+        display->SetChatMessage("system", message);
+        display->ShowNotification(message, 3000);
+    }
+
+    void MarkStopped(uint32_t stream_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stream_id != stream_id_) {
+            return;
+        }
+        task_handle_ = nullptr;
+        stop_requested_ = true;
     }
 };
 
@@ -284,6 +625,59 @@ void McpServer::AddCommonTools() {
         [](const PropertyList& properties) -> ReturnValue {
             (void)properties;
             return VoiceTimerManager::GetInstance().Cancel();
+        });
+
+    AddTool("self.radio.play",
+        "Play an internet radio stream on the device. Use this when the user asks to play internet radio, 网络收音机, 电台, or 在线电台. "
+        "If url is empty, search a public radio directory by name and prefer Ogg Opus streams. "
+        "This first implementation can directly play Ogg Opus streams; MP3/AAC stations need server-side transcoding.",
+        PropertyList({
+            Property("url", kPropertyTypeString, std::string("")),
+            Property("name", kPropertyTypeString, std::string("网络收音机"))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto url = properties["url"].value<std::string>();
+            auto name = properties["name"].value<std::string>();
+            return RadioStreamManager::GetInstance().Start(url, name);
+        });
+
+    AddTool("self.radio.list",
+        "List playable internet radio stations. Use this when the user asks what stations are available, 有哪些电台, 推荐几个电台, "
+        "or wants to test radio playback but does not know station names. This lists Ogg Opus stations that the current firmware can directly play.",
+        PropertyList({
+            Property("name", kPropertyTypeString, std::string("")),
+            Property("country", kPropertyTypeString, std::string("")),
+            Property("language", kPropertyTypeString, std::string("")),
+            Property("tag", kPropertyTypeString, std::string(""))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto name = properties["name"].value<std::string>();
+            auto country = properties["country"].value<std::string>();
+            auto language = properties["language"].value<std::string>();
+            auto tag = properties["tag"].value<std::string>();
+            return RadioStreamManager::GetInstance().List(name, country, language, tag);
+        });
+
+    AddTool("self.radio.stop",
+        "Stop the currently playing internet radio stream. Use this when the user says stop radio, 关闭电台, 停止网络收音机, or 不听了.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            return RadioStreamManager::GetInstance().Stop();
+        });
+
+    AddTool("self.music.play_test",
+        "Play the XiaoZhi music proxy test stream on the device. Use this when the user asks to test music playback, "
+        "测试音乐播放, 测试歌曲播放, or play the current MP3 transcoding test file. "
+        "The default URL points to the deployed music proxy test stream, but url and name can be overridden.",
+        PropertyList({
+            Property("url", kPropertyTypeString, std::string("http://miaomiao.atchain.cn/stream?file=1.mp3")),
+            Property("name", kPropertyTypeString, std::string("测试歌曲"))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto url = properties["url"].value<std::string>();
+            auto name = properties["name"].value<std::string>();
+            return RadioStreamManager::GetInstance().Start(url, name);
         });
 
     AddTool("self.system.check_and_upgrade_firmware",

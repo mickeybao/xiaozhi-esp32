@@ -5,6 +5,7 @@
 #include <string>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
+#include "gfx.h"
 #include "expression_emote.h"
 
 namespace emote {
@@ -36,6 +37,9 @@ private:
     virtual void Unlock() override;
 
     emote_handle_t emote_handle_ = nullptr;
+    gfx_image_dsc_t network_icon_dsc_ = {};
+    std::string battery_text_;
+    std::string network_text_;
 
 };
 

@@ -28,6 +28,8 @@
 #include "board.h"
 #include "gfx.h"
 #include "expression_emote.h"
+#include "application.h"
+#include "font_awesome.h"
 
 
 namespace emote {
@@ -65,6 +67,49 @@ static void OnFlushCallback(int x_start, int y_start, int x_end, int y_end, cons
     if (panel != nullptr) {
         esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, data);
     }
+}
+
+static bool SameIcon(const char* icon, const char* expected)
+{
+    return icon != nullptr && expected != nullptr && strcmp(icon, expected) == 0;
+}
+
+static bool IsWifiIcon(const char* icon)
+{
+    return SameIcon(icon, FONT_AWESOME_WIFI) ||
+        SameIcon(icon, FONT_AWESOME_WIFI_FAIR) ||
+        SameIcon(icon, FONT_AWESOME_WIFI_WEAK) ||
+        SameIcon(icon, FONT_AWESOME_WIFI_SLASH);
+}
+
+static const char* GetNetworkIconAssetName(const char* icon)
+{
+    if (IsWifiIcon(icon)) {
+        if (SameIcon(icon, FONT_AWESOME_WIFI_SLASH)) {
+            return "icon_wifi_off";
+        }
+        if (SameIcon(icon, FONT_AWESOME_WIFI_WEAK)) {
+            return "icon_wifi_weak";
+        }
+        if (SameIcon(icon, FONT_AWESOME_WIFI_FAIR)) {
+            return "icon_wifi_fair";
+        }
+        return "icon_wifi_strong";
+    }
+
+    if (SameIcon(icon, FONT_AWESOME_SIGNAL_OFF)) {
+        return "icon_4g_off";
+    }
+    if (SameIcon(icon, FONT_AWESOME_SIGNAL_WEAK)) {
+        return "icon_4g_weak";
+    }
+    if (SameIcon(icon, FONT_AWESOME_SIGNAL_FAIR)) {
+        return "icon_4g_fair";
+    }
+    if (SameIcon(icon, FONT_AWESOME_SIGNAL_GOOD)) {
+        return "icon_4g_good";
+    }
+    return "icon_4g_strong";
 }
 
 // ============================================================================
@@ -188,6 +233,48 @@ void EmoteDisplay::UpdateStatusBar(bool update_all)
     ESP_LOGD(TAG, "UpdateStatusBar: %s", update_all ? "true" : "false");
     if (!emote_handle_) {
         return;
+    }
+
+    auto& board = Board::GetInstance();
+
+    int battery_level = 0;
+    bool charging = false;
+    bool discharging = false;
+    if (board.GetBatteryLevel(battery_level, charging, discharging)) {
+        char battery_message[16];
+        snprintf(battery_message, sizeof(battery_message), "%d%%", battery_level);
+        battery_text_ = battery_message;
+        emote_lock(emote_handle_);
+        if (auto battery_label = emote_get_obj_by_name(emote_handle_, "battery_label")) {
+            gfx_label_set_text(battery_label, battery_text_.c_str());
+            gfx_obj_set_visible(battery_label, true);
+        }
+        emote_unlock(emote_handle_);
+    }
+
+    auto state = Application::GetInstance().GetDeviceState();
+    if (state == kDeviceStateIdle || state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring ||
+        state == kDeviceStateActivating) {
+        const char* network_icon = board.GetNetworkStateIcon();
+        const char* icon_name = GetNetworkIconAssetName(network_icon);
+        network_text_ = IsWifiIcon(network_icon) ? "WiFi" : "4G";
+        icon_data_t* icon = nullptr;
+        if (emote_get_icon_data_by_name(emote_handle_, icon_name, &icon) == ESP_OK && icon != nullptr && icon->data != nullptr) {
+            emote_lock(emote_handle_);
+            if (auto status_icon = emote_get_obj_by_name(emote_handle_, "status_icon")) {
+                memcpy(&network_icon_dsc_.header, icon->data, sizeof(gfx_image_header_t));
+                network_icon_dsc_.data = static_cast<const uint8_t*>(icon->data) + sizeof(gfx_image_header_t);
+                network_icon_dsc_.data_size = icon->size - sizeof(gfx_image_header_t);
+                gfx_img_set_src(status_icon, &network_icon_dsc_);
+                gfx_obj_set_visible(status_icon, true);
+            }
+            if (auto network_label = emote_get_obj_by_name(emote_handle_, "network_label")) {
+                gfx_label_set_text(network_label, network_text_.c_str());
+                gfx_obj_set_visible(network_label, true);
+            }
+            emote_unlock(emote_handle_);
+            RefreshAll();
+        }
     }
 }
 
