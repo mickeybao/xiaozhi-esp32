@@ -93,7 +93,16 @@
     - 5 EN 默认上拉到VIN
     - 6 BAT 电池供电引脚 3.4-4.2V 
         - 不可与VIN同时供电
-        - 通过此引脚供电 EN无效
+        - 通过此引脚供电 EN无效    
+### 4G模块 ML307R-DC
+- 引脚定义
+    - 1 BOOT
+    - 2 NET 网络指示灯
+    - 3 USB-DN
+    - 4 USB-DP
+    - 5 GND
+    - 6 5V    
+
 
 ### 引脚连接
 - ESP32-S3-Touch-LCD-2 
@@ -119,4 +128,11 @@
 - GPIO43/GPIO44 已专用于 4G UART，固件日志通过 USB Serial/JTAG 输出。
 - 开发板 17/18 脚是 GPIO19/GPIO20，同时也是原生 USB D-/D+。连接任何功放控制信号都会导致 Type-C 无法枚举。
 
+### 大眼睛表情
+- 参考喵伴项目
+    - https://espressif.craft.me/1gOl65rON8G8FK
+    - https://github.com/78/xiaozhi-esp32/tree/v2.4.0/main/boards/esp-vocat
+
+### 构建命令
+python .\scripts\release.py XiaoZhiWaveEsp32-s3-touch-lcd-2
 
