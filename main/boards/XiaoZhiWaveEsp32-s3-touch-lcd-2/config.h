@@ -60,7 +60,7 @@
 #define ML307_TX_PIN            GPIO_NUM_43
 #define ML307_RX_PIN            GPIO_NUM_44
 #define ML307_DTR_PIN           GPIO_NUM_NC
-#define ML307_BAUD_RATE         115200
+#define ML307_BAUD_RATE         921600
 #define DEFAULT_4G_NETWORK      1
 
 #endif // _BOARD_CONFIG_H_

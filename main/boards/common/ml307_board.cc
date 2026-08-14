@@ -88,6 +88,28 @@ void Ml307Board::NetworkTask() {
 
     ESP_LOGI(TAG, "Modem detected successfully");
 
+    auto at_uart = modem_->GetAtUart();
+    ESP_LOGI(TAG, "Querying ML307 UART baud-rate support: AT+IPR=?");
+    auto ipr_callback = at_uart->RegisterUrcCallback([](const std::string& command,
+                                                          const std::vector<AtArgumentValue>& arguments) {
+        if (command != "IPR") {
+            return;
+        }
+
+        std::string response;
+        for (size_t i = 0; i < arguments.size(); ++i) {
+            if (i > 0) {
+                response += ",";
+            }
+            response += arguments[i].string_value;
+        }
+        ESP_LOGI(TAG, "ML307 response: +IPR: %s", response.c_str());
+    });
+    if (!at_uart->SendCommand("AT+IPR=?", 3000)) {
+        ESP_LOGW(TAG, "ML307 baud-rate query failed or timed out");
+    }
+    at_uart->UnregisterUrcCallback(ipr_callback);
+
     // Set up network state change callback
     // Note: Don't call GetCarrierName() here as it sends AT command and will block ReceiveTask
     modem_->OnNetworkStateChanged([this](bool network_ready) {

@@ -335,23 +335,20 @@ void Application::ActivationTask() {
     ota_ = std::make_unique<Ota>();
 
     Schedule([]() {
-        auto display = Board::GetInstance().GetDisplay();
-        display->SetEmotion("thinking");
-        display->SetStatus("检查更新");
-        display->SetChatMessage("system", "正在检查固件和表情资源...");
+        Board::GetInstance().GetDisplay()->SetEmotion("thinking");
     });
 
     // Check for new firmware version
+    SetStartupMessage("检查更新", "[启动] 正在连接升级服务器...");
     CheckNewVersion();
 
     // Check for new assets version
+    SetStartupMessage("检查资源", "[启动] 正在检查表情资源包...");
     CheckAssetsVersion();
 
+    SetStartupMessage("准备连接", "[启动] 正在初始化语音服务...");
     Schedule([]() {
-        auto display = Board::GetInstance().GetDisplay();
-        display->SetEmotion("neutral");
-        display->SetStatus("准备连接");
-        display->SetChatMessage("system", "正在准备语音服务...");
+        Board::GetInstance().GetDisplay()->SetEmotion("neutral");
     });
 
     // Initialize the protocol
@@ -359,6 +356,15 @@ void Application::ActivationTask() {
 
     // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
+}
+
+void Application::SetStartupMessage(const char* status, const char* message) {
+    ESP_LOGI(TAG, "%s: %s", status, message);
+    Schedule([status = std::string(status), message = std::string(message)]() {
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetStatus(status.c_str());
+        display->SetChatMessage("system", message.c_str());
+    });
 }
 
 void Application::CheckAssetsVersion() {
@@ -374,6 +380,7 @@ void Application::CheckAssetsVersion() {
 
     if (!assets.partition_valid()) {
         ESP_LOGW(TAG, "Assets partition is disabled for board %s", BOARD_NAME);
+        SetStartupMessage("检查资源", "[启动] 未启用表情资源分区，跳过");
         return;
     }
     
@@ -382,6 +389,7 @@ void Application::CheckAssetsVersion() {
     std::string download_url = settings.GetString("download_url");
 
     if (!download_url.empty()) {
+        SetStartupMessage("更新资源", "[启动] 发现新资源包，准备下载...");
         char message[256];
         snprintf(message, sizeof(message), Lang::Strings::FOUND_NEW_ASSETS, download_url.c_str());
         Alert(Lang::Strings::LOADING_ASSETS, message, "cloud_arrow_down", Lang::Sounds::OGG_UPGRADE);
@@ -422,25 +430,35 @@ void Application::CheckAssetsVersion() {
     }
 
     // Apply assets
-    assets.Apply();
-    display->SetChatMessage("system", "");
-    display->SetEmotion("microchip_ai");
+    SetStartupMessage("加载资源", "[启动] 正在加载字体和表情资源...");
+    bool applied = assets.Apply();
+    if (applied) {
+        SetStartupMessage("加载资源", "[启动] 表情资源加载完成");
+    } else {
+        SetStartupMessage("加载资源", "[启动] 表情资源加载失败，使用内置界面");
+    }
+    Schedule([display]() {
+        display->SetEmotion("microchip_ai");
+    });
 }
 
 void Application::CheckNewVersion() {
-    const int MAX_RETRY = 10;
+    const int MAX_RETRY = 3;
     int retry_count = 0;
-    int retry_delay = 10; // Initial retry delay in seconds
+    constexpr int RETRY_DELAY_SECONDS = 10;
 
     auto& board = Board::GetInstance();
     while (true) {
         auto display = board.GetDisplay();
-        display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
+        char checking_message[96];
+        snprintf(checking_message, sizeof(checking_message),
+            "[启动] 正在检查固件版本（第 %d/%d 次）...", retry_count + 1, MAX_RETRY + 1);
+        SetStartupMessage(Lang::Strings::CHECKING_NEW_VERSION, checking_message);
 
         esp_err_t err = ota_->CheckVersion();
         if (err != ESP_OK) {
             retry_count++;
-            if (retry_count >= MAX_RETRY) {
+            if (retry_count > MAX_RETRY) {
                 ESP_LOGE(TAG, "Too many retries, exit version check");
                 return;
             }
@@ -448,21 +466,23 @@ void Application::CheckNewVersion() {
             char error_message[128];
             snprintf(error_message, sizeof(error_message), "code=%d, url=%s", err, ota_->GetCheckVersionUrl().c_str());
             char buffer[256];
-            snprintf(buffer, sizeof(buffer), Lang::Strings::CHECK_NEW_VERSION_FAILED, retry_delay, error_message);
+            snprintf(buffer, sizeof(buffer), Lang::Strings::CHECK_NEW_VERSION_FAILED, RETRY_DELAY_SECONDS, error_message);
             Alert(Lang::Strings::ERROR, buffer, "cloud_slash", Lang::Sounds::OGG_EXCLAMATION);
 
-            ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay, retry_count, MAX_RETRY);
-            for (int i = 0; i < retry_delay; i++) {
+            ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", RETRY_DELAY_SECONDS, retry_count, MAX_RETRY);
+            char retry_message[128];
+            snprintf(retry_message, sizeof(retry_message),
+                "[启动] 检查失败（错误 %d），%d 秒后重试 %d/%d", err, RETRY_DELAY_SECONDS, retry_count, MAX_RETRY);
+            SetStartupMessage("网络重试", retry_message);
+            for (int i = 0; i < RETRY_DELAY_SECONDS; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 if (GetDeviceState() == kDeviceStateIdle) {
                     break;
                 }
             }
-            retry_delay *= 2; // Double the retry delay
             continue;
         }
         retry_count = 0;
-        retry_delay = 10; // Reset retry delay
 
         if (ota_->HasNewVersion()) {
             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
@@ -473,6 +493,7 @@ void Application::CheckNewVersion() {
 
         // No new version, mark the current version as valid
         ota_->MarkCurrentVersionValid();
+        SetStartupMessage("检查更新", "[启动] 固件检查完成，当前已是最新版本");
         if (!ota_->HasActivationCode() && !ota_->HasActivationChallenge()) {
             // Exit the loop if done checking new version
             break;

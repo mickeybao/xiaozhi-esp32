@@ -164,6 +164,7 @@ private:
     void ActivationTask();
 
     // Helper methods
+    void SetStartupMessage(const char* status, const char* message);
     void CheckAssetsVersion();
     void CheckNewVersion();
     void InitializeProtocol();
