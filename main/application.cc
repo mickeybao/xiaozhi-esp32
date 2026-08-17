@@ -87,6 +87,9 @@ void Application::Initialize() {
 
     // Add state change listeners
     state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
+        if (old_state == kDeviceStateListening && new_state == kDeviceStateSpeaking) {
+            StopRadioPlayback(false);
+        }
         xEventGroupSetBits(event_group_, MAIN_EVENT_STATE_CHANGED);
     });
 
@@ -726,6 +729,15 @@ void Application::StopListening() {
 
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
+
+    if (IsRadioPlaying()) {
+        ESP_LOGI(TAG, "Stopping radio from touch/button interaction");
+        StopRadioPlayback(false);
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetStatus(state == kDeviceStateListening ? Lang::Strings::LISTENING : Lang::Strings::STANDBY);
+        display->SetChatMessage("system", "网络收音机已停止，可以继续对话");
+        return;
+    }
     
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -834,6 +846,8 @@ void Application::HandleWakeWordDetectedEvent() {
     if (!protocol_) {
         return;
     }
+
+    StopRadioPlayback(false);
 
     auto state = GetDeviceState();
     auto wake_word = audio_service_.GetLastWakeWord();

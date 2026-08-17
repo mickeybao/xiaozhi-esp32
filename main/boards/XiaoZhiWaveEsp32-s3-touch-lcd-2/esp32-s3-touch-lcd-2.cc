@@ -163,6 +163,8 @@ public:
 
     virtual void OutputData(std::vector<int16_t>& data) override {
         if (motion_muted_) {
+            ESP_LOGW(TAG, "OUTPUT-DIAG dropped %u samples because motion mute is active",
+                     static_cast<unsigned>(data.size()));
             return;
         }
         NoAudioCodecSimplex::OutputData(data);

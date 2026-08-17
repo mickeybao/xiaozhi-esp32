@@ -1,5 +1,7 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
@@ -288,6 +290,7 @@ void AudioService::AudioInputTask() {
 }
 
 void AudioService::AudioOutputTask() {
+    uint32_t output_task_count = 0;
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
         audio_queue_cv_.wait(lock, [this]() { return !audio_playback_queue_.empty() || service_stopped_; });
@@ -306,7 +309,29 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
 
+        ++output_task_count;
+        int16_t min_sample = INT16_MAX;
+        int16_t max_sample = INT16_MIN;
+        uint64_t sum_abs = 0;
+        size_t nonzero_samples = 0;
+        for (auto sample : task->pcm) {
+            min_sample = std::min(min_sample, sample);
+            max_sample = std::max(max_sample, sample);
+            sum_abs += static_cast<uint64_t>(sample < 0 ? -static_cast<int32_t>(sample) : sample);
+            nonzero_samples += sample != 0;
+        }
+        bool trace_output = output_task_count <= 20 || output_task_count % 50 == 0;
+        if (trace_output) {
+            ESP_LOGI(TAG, "OUTPUT-DIAG #%lu samples=%u nonzero=%u min=%d max=%d avg_abs=%u enabled=%d volume=%d",
+                     static_cast<unsigned long>(output_task_count), static_cast<unsigned>(task->pcm.size()),
+                     static_cast<unsigned>(nonzero_samples), min_sample, max_sample,
+                     task->pcm.empty() ? 0 : static_cast<unsigned>(sum_abs / task->pcm.size()),
+                     codec_->output_enabled(), codec_->output_volume());
+        }
         codec_->OutputData(task->pcm);
+        if (trace_output) {
+            ESP_LOGI(TAG, "OUTPUT-DIAG #%lu completed", static_cast<unsigned long>(output_task_count));
+        }
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -513,6 +538,33 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
         }
     }
     audio_decode_queue_.push_back(std::move(packet));
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
+bool AudioService::PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, bool wait) {
+    if (pcm.empty()) {
+        return true;
+    }
+
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->timestamp = 0;
+    task->pcm = std::move(pcm);
+
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    if (audio_playback_queue_.size() >= MAX_PLAYBACK_TASKS_IN_QUEUE) {
+        if (!wait) {
+            return false;
+        }
+        audio_queue_cv_.wait(lock, [this]() {
+            return service_stopped_ || audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE;
+        });
+    }
+    if (service_stopped_) {
+        return false;
+    }
+    audio_playback_queue_.push_back(std::move(task));
     audio_queue_cv_.notify_all();
     return true;
 }

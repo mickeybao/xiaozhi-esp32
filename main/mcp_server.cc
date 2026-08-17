@@ -16,6 +16,9 @@
 #include <mutex>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_audio_simple_dec.h>
+#include <esp_mp3_dec.h>
+#include <esp_ae_rate_cvt.h>
 
 #include "application.h"
 #include "display.h"
@@ -212,7 +215,6 @@ private:
         Application::GetInstance().Schedule([]() {
             static constexpr const char* kReminderText = "\xE6\x8F\x90\xE9\x86\x92";
             static constexpr const char* kTimeUpText = "\xE6\x97\xB6\xE9\x97\xB4\xE5\x88\xB0\xE5\x95\xA6";
-            auto& app = Application::GetInstance();
             auto& board = Board::GetInstance();
             if (auto backlight = board.GetBacklight()) {
                 backlight->RestoreBrightness();
@@ -247,7 +249,10 @@ public:
         std::string stream_url = url;
         std::string station_name = name.empty() ? "网络收音机" : name;
         if (stream_url.empty()) {
-            auto resolved = ResolveStationUrl(station_name);
+            auto resolved = ResolvePresetUrl(station_name);
+            if (resolved.empty()) {
+                resolved = ResolveStationUrl(station_name);
+            }
             if (resolved.empty()) {
                 return "没有找到可直接播放的 Ogg Opus 电台。可以换一个电台名称，或在后台把 MP3/AAC 电台转码成 Ogg Opus。";
             }
@@ -257,7 +262,7 @@ public:
             return "网络收音机 URL 必须以 http:// 或 https:// 开头";
         }
 
-        Stop();
+        Stop(false);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stream_id_++;
@@ -283,24 +288,60 @@ public:
         return "Radio started";
     }
 
-    std::string Stop() {
+    std::string Stop(bool update_display = true) {
+        bool was_running = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            was_running = !stop_requested_ || task_handle_ != nullptr;
             stop_requested_ = true;
         }
+        if (!was_running) {
+            return "Radio already stopped";
+        }
         Application::GetInstance().GetAudioService().ResetDecoder();
-        auto display = Board::GetInstance().GetDisplay();
-        display->SetChatMessage("system", "网络收音机已停止");
-        display->SetStatus(Lang::Strings::STANDBY);
+        if (update_display) {
+            auto display = Board::GetInstance().GetDisplay();
+            display->SetChatMessage("system", "网络收音机已停止");
+            display->SetStatus(Lang::Strings::STANDBY);
+        }
         return "Radio stopped";
+    }
+
+    bool IsRunning() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return task_handle_ != nullptr && !stop_requested_;
     }
 
     std::string List(const std::string& name, const std::string& country,
                      const std::string& language, const std::string& tag) {
+        if (country.empty() && language.empty() && tag.empty()) {
+            auto presets = ListPresetStations(name);
+            if (!presets.empty()) {
+                return presets;
+            }
+        }
         return ListStations(name, country, language, tag);
     }
 
 private:
+    struct RadioPreset {
+        const char* name;
+        const char* keywords;
+        const char* url;
+    };
+
+    static constexpr RadioPreset kPresets[] = {
+        {"中国之声", "中央广播 中国之声 CNR1 新闻台", "https://lhttp.qtfm.cn/live/15318317/64k.mp3"},
+        {"国际新闻", "国际新闻 新闻台", "https://lhttp.qtfm.cn/live/20500172/64k.mp3"},
+        {"怀集音乐之声", "怀集 音乐之声 音乐台", "https://lhttp.qingting.fm/live/4804/64k.mp3"},
+        {"清晨音乐台", "清晨 音乐台", "http://lhttp.qingting.fm/live/4915/64k.mp3"},
+        {"80后音悦台", "80后 八零后 音悦台", "http://lhttp.qingting.fm/live/20207761/64k.mp3"},
+        {"两广之声音乐台", "两广之声 两广 音乐台", "https://lhttp.qtfm.cn/live/20500149/64k.mp3"},
+        {"动听音乐台", "动听 音乐台", "https://lhttp-hw.qtfm.cn/live/5022107/64k.mp3"},
+        {"Chinese Classical Music", "中文民乐 中国民乐 民乐", "https://radio.chinesemusicworld.com/chinesemusic.mp3"},
+        {"REPLAY NEWS 中文", "Replay News 中文新闻 新闻台", "https://replaynewszh.ice.infomaniak.ch/replaynewszh-128.mp3"},
+    };
+
     std::mutex mutex_;
     TaskHandle_t task_handle_ = nullptr;
     bool stop_requested_ = false;
@@ -309,6 +350,50 @@ private:
     std::string name_;
 
     RadioStreamManager() = default;
+
+    bool ContainsIgnoreCase(const std::string& text, const std::string& query) {
+        if (query.empty()) {
+            return true;
+        }
+        auto lower = [](unsigned char value) { return static_cast<char>(std::tolower(value)); };
+        std::string lowered_text(text.size(), '\0');
+        std::string lowered_query(query.size(), '\0');
+        std::transform(text.begin(), text.end(), lowered_text.begin(), lower);
+        std::transform(query.begin(), query.end(), lowered_query.begin(), lower);
+        return lowered_text.find(lowered_query) != std::string::npos;
+    }
+
+    std::string ResolvePresetUrl(const std::string& name) {
+        if (name.empty() || name == "网络收音机" || name == "电台") {
+            return kPresets[0].url;
+        }
+        for (const auto& preset : kPresets) {
+            if (ContainsIgnoreCase(preset.name, name) ||
+                ContainsIgnoreCase(preset.keywords, name)) {
+                return preset.url;
+            }
+        }
+        return "";
+    }
+
+    std::string ListPresetStations(const std::string& name) {
+        std::string result;
+        int count = 0;
+        for (const auto& preset : kPresets) {
+            if (!name.empty() && !ContainsIgnoreCase(preset.name, name) &&
+                !ContainsIgnoreCase(preset.keywords, name)) {
+                continue;
+            }
+            if (result.empty()) {
+                result = "内置中文 MP3 电台：";
+            }
+            result += "\n" + std::to_string(++count) + ". " + preset.name;
+        }
+        if (!result.empty()) {
+            result += "\n可以直接说：播放中国之声、国际新闻、80后音悦台或中文民乐。";
+        }
+        return result;
+    }
 
     std::string UrlEncode(const std::string& value) {
         static const char hex[] = "0123456789ABCDEF";
@@ -486,6 +571,199 @@ private:
         return stop_requested_ || stream_id != stream_id_;
     }
 
+    bool StreamMp3(Http& http, uint32_t stream_id) {
+        static std::once_flag decoder_registration;
+        static esp_audio_err_t registration_result = ESP_AUDIO_ERR_OK;
+        std::call_once(decoder_registration, []() {
+            registration_result = esp_mp3_dec_register();
+        });
+        if (registration_result != ESP_AUDIO_ERR_OK) {
+            ESP_LOGE(TAG, "MP3 decoder registration failed: %d", registration_result);
+            return false;
+        }
+
+        esp_audio_simple_dec_cfg_t decoder_config = {
+            .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
+            .dec_cfg = nullptr,
+            .cfg_size = 0,
+            .use_frame_dec = false,
+        };
+        esp_audio_simple_dec_handle_t decoder = nullptr;
+        auto result = esp_audio_simple_dec_open(&decoder_config, &decoder);
+        if (result != ESP_AUDIO_ERR_OK || decoder == nullptr) {
+            ESP_LOGE(TAG, "MP3 decoder open failed: %d", result);
+            return false;
+        }
+
+        auto& audio_service = Application::GetInstance().GetAudioService();
+        const int output_rate = Board::GetInstance().GetAudioCodec()->output_sample_rate();
+        esp_ae_rate_cvt_handle_t resampler = nullptr;
+        int resampler_source_rate = 0;
+        bool pcm_started = false;
+        std::vector<uint8_t> input(2048);
+        std::vector<uint8_t> output(8192);
+        uint32_t read_count = 0;
+        uint32_t decode_count = 0;
+        size_t input_total = 0;
+        size_t pcm_total = 0;
+
+        while (!ShouldStop(stream_id)) {
+            int read = http.Read(reinterpret_cast<char*>(input.data()), input.size());
+            ++read_count;
+            if (read > 0) {
+                input_total += read;
+            }
+            bool trace_read = read_count <= 20 || read_count % 50 == 0 || read <= 0;
+            if (trace_read) {
+                ESP_LOGI(TAG, "MP3-DIAG read#%lu bytes=%d input_total=%u stop=%d",
+                         static_cast<unsigned long>(read_count), read, static_cast<unsigned>(input_total),
+                         ShouldStop(stream_id));
+            }
+            if (read < 0) {
+                ESP_LOGE(TAG, "MP3 stream read failed");
+                break;
+            }
+            if (read == 0) {
+                ESP_LOGI(TAG, "MP3 stream reached EOF");
+                break;
+            }
+
+            esp_audio_simple_dec_raw_t raw = {
+                .buffer = input.data(),
+                .len = static_cast<uint32_t>(read),
+                .eos = false,
+                .consumed = 0,
+                .frame_recover = ESP_AUDIO_SIMPLE_DEC_RECOVERY_NONE,
+            };
+            while (raw.len > 0 && !ShouldStop(stream_id)) {
+                esp_audio_simple_dec_out_t frame = {
+                    .buffer = output.data(),
+                    .len = static_cast<uint32_t>(output.size()),
+                    .needed_size = 0,
+                    .decoded_size = 0,
+                };
+                result = esp_audio_simple_dec_process(decoder, &raw, &frame);
+                ++decode_count;
+                bool trace_decode = decode_count <= 20 || decode_count % 50 == 0 || result != ESP_AUDIO_ERR_OK;
+                if (trace_decode) {
+                    ESP_LOGI(TAG, "MP3-DIAG decode#%lu result=%d raw_len=%lu consumed=%lu decoded=%lu needed=%lu out_cap=%u",
+                             static_cast<unsigned long>(decode_count), result, static_cast<unsigned long>(raw.len),
+                             static_cast<unsigned long>(raw.consumed), static_cast<unsigned long>(frame.decoded_size),
+                             static_cast<unsigned long>(frame.needed_size), static_cast<unsigned>(output.size()));
+                }
+                if (result == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH && frame.needed_size > output.size()) {
+                    output.resize(frame.needed_size);
+                    continue;
+                }
+                if (result != ESP_AUDIO_ERR_OK) {
+                    ESP_LOGE(TAG, "MP3 decode failed: %d", result);
+                    raw.len = 0;
+                    break;
+                }
+
+                if (frame.decoded_size > 0) {
+                    esp_audio_simple_dec_info_t info = {};
+                    if (esp_audio_simple_dec_get_info(decoder, &info) != ESP_AUDIO_ERR_OK ||
+                        info.bits_per_sample != 16 || info.channel == 0) {
+                        ESP_LOGE(TAG, "Unsupported MP3 PCM format");
+                        raw.len = 0;
+                        break;
+                    }
+
+                    const auto* samples = reinterpret_cast<const int16_t*>(frame.buffer);
+                    size_t sample_count = frame.decoded_size / sizeof(int16_t);
+                    size_t frame_count = sample_count / info.channel;
+                    std::vector<int16_t> mono(frame_count);
+                    for (size_t i = 0; i < frame_count; ++i) {
+                        if (info.channel == 1) {
+                            mono[i] = samples[i];
+                        } else {
+                            int32_t mixed = 0;
+                            for (int channel = 0; channel < info.channel; ++channel) {
+                                mixed += samples[i * info.channel + channel];
+                            }
+                            mono[i] = static_cast<int16_t>(mixed / info.channel);
+                        }
+                    }
+
+                    if (!pcm_started) {
+                        ESP_LOGI(TAG, "MP3 PCM ready: %lu Hz, %u channel, %u bit, %lu bps",
+                                 static_cast<unsigned long>(info.sample_rate), info.channel,
+                                 info.bits_per_sample, static_cast<unsigned long>(info.bitrate));
+                        pcm_started = true;
+                    }
+
+                    if (static_cast<int>(info.sample_rate) != output_rate) {
+                        size_t source_samples = mono.size();
+                        if (resampler == nullptr || resampler_source_rate != static_cast<int>(info.sample_rate)) {
+                            if (resampler != nullptr) {
+                                esp_ae_rate_cvt_close(resampler);
+                            }
+                            esp_ae_rate_cvt_cfg_t rate_config = {
+                                .src_rate = info.sample_rate,
+                                .dest_rate = static_cast<uint32_t>(output_rate),
+                                .channel = 1,
+                                .bits_per_sample = 16,
+                                .complexity = 1,
+                                .perf_type = ESP_AE_RATE_CVT_PERF_TYPE_MEMORY,
+                            };
+                            if (esp_ae_rate_cvt_open(&rate_config, &resampler) != ESP_AE_ERR_OK || resampler == nullptr) {
+                                ESP_LOGE(TAG, "MP3 resampler open failed: %lu -> %d",
+                                         static_cast<unsigned long>(info.sample_rate), output_rate);
+                                raw.len = 0;
+                                break;
+                            }
+                            resampler_source_rate = info.sample_rate;
+                        }
+                        uint32_t output_samples = 0;
+                        esp_ae_rate_cvt_get_max_out_sample_num(resampler, mono.size(), &output_samples);
+                        std::vector<int16_t> converted(output_samples);
+                        if (esp_ae_rate_cvt_process(resampler, mono.data(), mono.size(),
+                                                    converted.data(), &output_samples) != ESP_AE_ERR_OK) {
+                            ESP_LOGE(TAG, "MP3 resampling failed");
+                            raw.len = 0;
+                            break;
+                        }
+                        converted.resize(output_samples);
+                        mono = std::move(converted);
+                        if (trace_decode) {
+                            ESP_LOGI(TAG, "MP3-DIAG resample src=%u@%lu dst=%u@%d",
+                                     static_cast<unsigned>(source_samples), static_cast<unsigned long>(info.sample_rate),
+                                     static_cast<unsigned>(mono.size()), output_rate);
+                        }
+                    }
+
+                    size_t playback_samples = mono.size();
+                    bool queued = audio_service.PushPcmToPlaybackQueue(std::move(mono), true);
+                    pcm_total += playback_samples;
+                    if (trace_decode || !queued) {
+                        ESP_LOGI(TAG, "MP3-DIAG queue samples=%u pcm_total=%u queued=%d",
+                                 static_cast<unsigned>(playback_samples), static_cast<unsigned>(pcm_total), queued);
+                    }
+                    if (!queued) {
+                        raw.len = 0;
+                        break;
+                    }
+                }
+
+                if (raw.consumed == 0 || raw.consumed > raw.len) {
+                    break;
+                }
+                raw.buffer += raw.consumed;
+                raw.len -= raw.consumed;
+            }
+        }
+
+        if (resampler != nullptr) {
+            esp_ae_rate_cvt_close(resampler);
+        }
+        esp_audio_simple_dec_close(decoder);
+        ESP_LOGI(TAG, "MP3 stream stopped, pcm_started=%d reads=%lu decodes=%lu input=%u pcm=%u",
+                 pcm_started, static_cast<unsigned long>(read_count), static_cast<unsigned long>(decode_count),
+                 static_cast<unsigned>(input_total), static_cast<unsigned>(pcm_total));
+        return pcm_started;
+    }
+
     void StreamTask() {
         std::string url;
         std::string name;
@@ -497,26 +775,100 @@ private:
             stream_id = stream_id_;
         }
 
-        auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
-        http->SetTimeout(20000);
-        http->SetHeader("Accept", "audio/ogg, application/ogg, audio/opus, */*");
-        if (!http->Open("GET", url)) {
-            ShowError("电台连接失败");
+        struct ConnectionCandidate {
+            std::string url;
+            std::string host_header;
+        };
+        std::vector<ConnectionCandidate> candidates = {{url, ""}, {url, ""}};
+        static constexpr const char* kQtPrimaryHost = "lhttp.qtfm.cn";
+        auto primary_host_pos = url.find(kQtPrimaryHost);
+        if (primary_host_pos != std::string::npos) {
+            auto backup_url = url;
+            backup_url.replace(primary_host_pos, strlen(kQtPrimaryHost), "lhttp.qingting.fm");
+            candidates.push_back({std::move(backup_url), ""});
+
+            auto ip_url = url;
+            ip_url.replace(0, primary_host_pos + strlen(kQtPrimaryHost), "http://123.60.16.94");
+            candidates.push_back({std::move(ip_url), kQtPrimaryHost});
+        }
+
+        std::unique_ptr<Http> http;
+        std::string current_url;
+        int status_code = -1;
+        bool connected = false;
+        for (size_t attempt = 0; attempt < candidates.size() && !ShouldStop(stream_id); ++attempt) {
+            current_url = candidates[attempt].url;
+            ESP_LOGI(TAG, "Radio connection attempt %u/%u: %s", static_cast<unsigned>(attempt + 1),
+                     static_cast<unsigned>(candidates.size()), current_url.c_str());
+            for (int redirect = 0; redirect < 4 && !ShouldStop(stream_id); ++redirect) {
+                http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+                http->SetTimeout(20000);
+                http->SetHeader("Accept", "audio/mpeg, audio/ogg, application/ogg, audio/opus, */*");
+                http->SetHeader("User-Agent", "XiaoZhiWave-Radio/1.0");
+                if (!candidates[attempt].host_header.empty()) {
+                    http->SetHeader("Host", candidates[attempt].host_header);
+                }
+                if (!http->Open("GET", current_url)) {
+                    ESP_LOGW(TAG, "Radio connection attempt %u failed, error=%d",
+                             static_cast<unsigned>(attempt + 1), http->GetLastError());
+                    break;
+                }
+
+                status_code = http->GetStatusCode();
+                if (status_code >= 300 && status_code < 400) {
+                    auto location = http->GetResponseHeader("Location");
+                    http->Close();
+                    if (location.rfind("http://", 0) != 0 && location.rfind("https://", 0) != 0) {
+                        location.clear();
+                    }
+                    if (location.empty()) {
+                        break;
+                    }
+                    ESP_LOGI(TAG, "Radio redirect %d: %s", status_code, location.c_str());
+                    current_url = location;
+                    continue;
+                }
+                connected = status_code >= 200 && status_code < 300;
+                break;
+            }
+            if (connected) {
+                break;
+            }
+        }
+
+        if (!http || !connected || ShouldStop(stream_id)) {
+            if (http) {
+                http->Close();
+            }
+            if (!ShouldStop(stream_id)) {
+                ShowError(stream_id, status_code < 0 ? "电台连接超时" : "电台响应异常");
+            }
             MarkStopped(stream_id);
             return;
         }
 
-        int status_code = http->GetStatusCode();
-        if (status_code < 200 || status_code >= 300) {
+        auto content_type = http->GetResponseHeader("Content-Type");
+        bool is_mp3 = current_url.find(".mp3") != std::string::npos ||
+                      content_type.find("audio/mpeg") != std::string::npos ||
+                      content_type.find("audio/mp3") != std::string::npos;
+        ESP_LOGI(TAG, "Radio stream opened: status=%d, type=%s, decoder=%s",
+                 status_code, content_type.c_str(), is_mp3 ? "MP3" : "Ogg Opus");
+        if (is_mp3) {
+            bool played = StreamMp3(*http, stream_id);
             http->Close();
-            ShowError("电台响应异常");
+            if (!played && !ShouldStop(stream_id)) {
+                ShowError(stream_id, "MP3解码失败");
+            }
             MarkStopped(stream_id);
             return;
         }
 
         auto& audio_service = Application::GetInstance().GetAudioService();
         auto demuxer = std::make_unique<OggDemuxer>();
-        demuxer->OnDemuxerFinished([&audio_service](const uint8_t* data, int sample_rate, size_t size) {
+        demuxer->OnDemuxerFinished([this, &audio_service, stream_id](const uint8_t* data, int sample_rate, size_t size) {
+            if (ShouldStop(stream_id)) {
+                return;
+            }
             auto packet = std::make_unique<AudioStreamPacket>();
             packet->sample_rate = sample_rate;
             packet->frame_duration = 60;
@@ -530,12 +882,17 @@ private:
         while (!ShouldStop(stream_id)) {
             int ret = http->Read(buffer, sizeof(buffer));
             if (ret < 0) {
-                ShowError("电台读取失败");
+                if (!ShouldStop(stream_id)) {
+                    ShowError(stream_id, "电台读取失败");
+                }
                 break;
             }
             if (ret == 0) {
                 vTaskDelay(pdMS_TO_TICKS(20));
                 continue;
+            }
+            if (ShouldStop(stream_id)) {
+                break;
             }
             demuxer->Process(reinterpret_cast<const uint8_t*>(buffer), ret);
         }
@@ -544,7 +901,10 @@ private:
         MarkStopped(stream_id);
     }
 
-    void ShowError(const char* message) {
+    void ShowError(uint32_t stream_id, const char* message) {
+        if (ShouldStop(stream_id)) {
+            return;
+        }
         auto display = Board::GetInstance().GetDisplay();
         display->SetEmotion("confused");
         display->SetChatMessage("system", message);
@@ -562,6 +922,17 @@ private:
 };
 
 } // namespace
+
+bool IsRadioPlaying() {
+    return RadioStreamManager::GetInstance().IsRunning();
+}
+
+void StopRadioPlayback(bool update_display) {
+    if (RadioStreamManager::GetInstance().IsRunning()) {
+        ESP_LOGI(TAG, "Stopping radio for user interaction");
+        RadioStreamManager::GetInstance().Stop(update_display);
+    }
+}
 
 McpServer::McpServer() {
 }
@@ -629,8 +1000,9 @@ void McpServer::AddCommonTools() {
 
     AddTool("self.radio.play",
         "Play an internet radio stream on the device. Use this when the user asks to play internet radio, 网络收音机, 电台, or 在线电台. "
-        "If url is empty, search a public radio directory by name and prefer Ogg Opus streams. "
-        "This first implementation can directly play Ogg Opus streams; MP3/AAC stations need server-side transcoding.",
+        "If url is empty, first match a built-in Chinese MP3 station by name, then search a public radio directory. "
+        "Built-in choices include 中国之声, 国际新闻, music stations, and Chinese classical music. "
+        "The firmware directly plays MP3 and Ogg Opus streams; AAC/AAC+ is not supported yet.",
         PropertyList({
             Property("url", kPropertyTypeString, std::string("")),
             Property("name", kPropertyTypeString, std::string("网络收音机"))
@@ -643,7 +1015,7 @@ void McpServer::AddCommonTools() {
 
     AddTool("self.radio.list",
         "List playable internet radio stations. Use this when the user asks what stations are available, 有哪些电台, 推荐几个电台, "
-        "or wants to test radio playback but does not know station names. This lists Ogg Opus stations that the current firmware can directly play.",
+        "or wants to test radio playback but does not know station names. With no filters this returns built-in Chinese MP3 stations.",
         PropertyList({
             Property("name", kPropertyTypeString, std::string("")),
             Property("country", kPropertyTypeString, std::string("")),

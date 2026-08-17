@@ -13,6 +13,9 @@
 
 #include <cJSON.h>
 
+bool IsRadioPlaying();
+void StopRadioPlayback(bool update_display = false);
+
 class ImageContent {
 private:
     std::string encoded_data_;
