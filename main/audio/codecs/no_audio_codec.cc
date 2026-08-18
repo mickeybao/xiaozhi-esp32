@@ -237,7 +237,7 @@ int NoAudioCodec::Write(const int16_t* data, int samples) {
 
     size_t bytes_written;
     esp_err_t result = i2s_channel_write(tx_handle_, buffer.data(), samples * sizeof(int32_t), &bytes_written, portMAX_DELAY);
-    bool trace_write = write_count <= 20 || write_count % 50 == 0 || result != ESP_OK || bytes_written != samples * sizeof(int32_t);
+    bool trace_write = write_count <= 3 || write_count % 500 == 0 || result != ESP_OK || bytes_written != samples * sizeof(int32_t);
     if (trace_write) {
         ESP_LOGI(TAG, "I2S-DIAG #%lu samples=%d request_bytes=%u written=%u result=%s volume=%d factor=%ld enabled=%d",
                  static_cast<unsigned long>(write_count), samples, static_cast<unsigned>(samples * sizeof(int32_t)),

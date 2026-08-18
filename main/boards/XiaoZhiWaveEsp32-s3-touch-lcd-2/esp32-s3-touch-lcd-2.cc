@@ -29,7 +29,12 @@
 #include <functional>
 #include <cmath>
 #include <memory>
+#include <ctime>
 #include <string_view>
+
+LV_FONT_DECLARE(clock_digits_64);
+LV_FONT_DECLARE(font_maison_neue_book_26);
+LV_FONT_DECLARE(font_puhui_basic_20_4);
 
 #define TAG "WaveshareEsp32s3TouchLCD2inch"
 
@@ -135,6 +140,30 @@ class MotionAwareEmoteDisplay : public emote::EmoteDisplay {
 public:
     using emote::EmoteDisplay::EmoteDisplay;
 
+    void SetPowerSaveMode(bool on) override {
+        emote::EmoteDisplay::SetPowerSaveMode(on);
+        SetClockMode(on);
+    }
+
+    void SetClockMode(bool on) {
+        if (sleep_clock_visible_ == on) {
+            if (on) {
+                UpdateClockText(false);
+            }
+            return;
+        }
+        sleep_clock_visible_ = on;
+        ConfigureClockMode();
+    }
+
+    void UpdateStatusBar(bool update_all = false) override {
+        if (!sleep_clock_visible_) {
+            emote::EmoteDisplay::UpdateStatusBar(update_all);
+            return;
+        }
+        UpdateClockText(false);
+    }
+
     void SetEmotionOffset(int16_t offset_x) {
         auto handle = GetEmoteHandle();
         if (handle == nullptr) {
@@ -151,6 +180,94 @@ public:
         emote_unlock(handle);
         RefreshAll();
     }
+
+private:
+    bool sleep_clock_visible_ = false;
+    gfx_obj_t* seconds_label_ = nullptr;
+    int last_clock_minute_ = -1;
+    int last_clock_second_ = -1;
+
+    void ConfigureClockMode() {
+        auto handle = GetEmoteHandle();
+        if (handle == nullptr) {
+            return;
+        }
+
+        if (seconds_label_ == nullptr) {
+            seconds_label_ = emote_create_obj_by_type(handle, "label", "clock_seconds_label");
+        }
+
+        emote_lock(handle);
+        if (auto clock_label = emote_get_obj_by_name(handle, "clock_label")) {
+            if (sleep_clock_visible_) {
+                gfx_obj_align(clock_label, GFX_ALIGN_CENTER, 0, -4);
+                gfx_obj_set_size(clock_label, 220, 80);
+                gfx_label_set_font(clock_label, (void*)&clock_digits_64);
+                gfx_label_set_text_align(clock_label, GFX_TEXT_ALIGN_CENTER);
+                gfx_label_set_bg_color(clock_label, GFX_COLOR_HEX(0x000000));
+                gfx_label_set_bg_enable(clock_label, true);
+            } else {
+                gfx_obj_align(clock_label, GFX_ALIGN_TOP_MID, 0, 20);
+                gfx_obj_set_size(clock_label, 90, 50);
+                gfx_label_set_font(clock_label, (void*)&font_maison_neue_book_26);
+                gfx_label_set_bg_enable(clock_label, false);
+            }
+            gfx_obj_set_visible(clock_label, true);
+        }
+        if (seconds_label_ != nullptr) {
+            gfx_obj_align(seconds_label_, GFX_ALIGN_BOTTOM_RIGHT, -14, -14);
+            gfx_obj_set_size(seconds_label_, 42, 28);
+            gfx_label_set_font(seconds_label_, (void*)&font_puhui_basic_20_4);
+            gfx_label_set_text_align(seconds_label_, GFX_TEXT_ALIGN_CENTER);
+            gfx_label_set_color(seconds_label_, GFX_COLOR_HEX(0xFFFFFF));
+            gfx_label_set_bg_color(seconds_label_, GFX_COLOR_HEX(0x000000));
+            gfx_label_set_bg_enable(seconds_label_, true);
+            gfx_obj_set_visible(seconds_label_, sleep_clock_visible_);
+        }
+        if (auto eye_anim = emote_get_obj_by_name(handle, "eye_anim")) {
+            gfx_obj_set_visible(eye_anim, !sleep_clock_visible_);
+        }
+        if (auto emerg_dlg = emote_get_obj_by_name(handle, "emerg_dlg")) {
+            gfx_obj_set_visible(emerg_dlg, !sleep_clock_visible_);
+        }
+        emote_unlock(handle);
+
+        last_clock_minute_ = -1;
+        last_clock_second_ = -1;
+        UpdateClockText(true);
+        RefreshAll();
+    }
+
+    void UpdateClockText(bool force) {
+        if (!sleep_clock_visible_) {
+            return;
+        }
+        auto handle = GetEmoteHandle();
+        if (handle == nullptr) {
+            return;
+        }
+
+        time_t now = time(nullptr);
+        struct tm time_info = {};
+        localtime_r(&now, &time_info);
+
+        emote_lock(handle);
+        if ((force || time_info.tm_min != last_clock_minute_)) {
+            if (auto clock_label = emote_get_obj_by_name(handle, "clock_label")) {
+                char minute_text[8];
+                strftime(minute_text, sizeof(minute_text), "%H:%M", &time_info);
+                gfx_label_set_text(clock_label, minute_text);
+            }
+            last_clock_minute_ = time_info.tm_min;
+        }
+        if ((force || time_info.tm_sec != last_clock_second_) && seconds_label_ != nullptr) {
+            char second_text[4];
+            strftime(second_text, sizeof(second_text), "%S", &time_info);
+            gfx_label_set_text(seconds_label_, second_text);
+            last_clock_second_ = time_info.tm_sec;
+        }
+        emote_unlock(handle);
+    }
 };
 
 class MotionAwareNoAudioCodecSimplex : public NoAudioCodecSimplex {
@@ -161,9 +278,22 @@ public:
         motion_muted_ = muted;
     }
 
+    void SetSleepMuted(bool muted) {
+        sleep_muted_ = muted;
+    }
+
+    void Start() override {
+        Settings settings("audio");
+        bool has_saved_volume = settings.GetInt("output_volume", -1) >= 0;
+        NoAudioCodecSimplex::Start();
+        if (!has_saved_volume) {
+            SetOutputVolume(75);
+        }
+    }
+
     virtual void OutputData(std::vector<int16_t>& data) override {
-        if (motion_muted_) {
-            ESP_LOGW(TAG, "OUTPUT-DIAG dropped %u samples because motion mute is active",
+        if (motion_muted_ || sleep_muted_) {
+            ESP_LOGW(TAG, "OUTPUT-DIAG dropped %u samples because temporary mute is active",
                      static_cast<unsigned>(data.size()));
             return;
         }
@@ -172,6 +302,7 @@ public:
 
 private:
     std::atomic<bool> motion_muted_ = false;
+    std::atomic<bool> sleep_muted_ = false;
 };
 
 class WaveshareEsp32s3TouchLCD2inch : public DualNetworkBoard {
@@ -191,6 +322,7 @@ private:
     std::atomic<bool> motion_sleeping_ = false;
     std::atomic<bool> face_down_muted_ = false;
     std::atomic<bool> tilt_left_active_ = false;
+    std::atomic<bool> upright_clock_active_ = false;
     std::atomic<bool> temporary_motion_emotion_ = false;
 
     static constexpr const char* kAwakeEmotion = "surprised";
@@ -227,11 +359,13 @@ private:
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        power_save_timer_ = new PowerSaveTimer(-1, -1, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
+            static_cast<MotionAwareNoAudioCodecSimplex*>(GetAudioCodec())->SetSleepMuted(true);
             GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(20); });
+            GetBacklight()->SetBrightness(30); });
         power_save_timer_->OnExitSleepMode([this]() {
+            static_cast<MotionAwareNoAudioCodecSimplex*>(GetAudioCodec())->SetSleepMuted(false);
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness(); });
         power_save_timer_->SetEnabled(true);
@@ -278,9 +412,9 @@ private:
         xTaskCreate([](void* arg) {
             auto* self = static_cast<WaveshareEsp32s3TouchLCD2inch*>(arg);
             int normal_samples = 0;
-            int still_flat_samples = 0;
             int face_down_samples = 0;
             int face_up_samples = 0;
+            int upright_samples = 0;
             Qmi8658::AccelData prev = {};
             bool has_prev = false;
             int64_t last_shake_ms = 0;
@@ -288,13 +422,13 @@ private:
 
             constexpr float kShakeDeltaThresholdG = 2.4f;
             constexpr int64_t kShakeCooldownMs = 2000;
-            constexpr float kStillDeltaThresholdG = 0.08f;
             constexpr float kWakeDeltaThresholdG = 0.28f;
             constexpr float kFlatZThresholdG = 0.75f;
+            constexpr float kUprightZThresholdG = 0.35f;
             constexpr float kTiltLeftThresholdG = -0.45f;
-            constexpr int kStillFlatSamples = 75;
             constexpr int kFaceDownSamples = 8;
             constexpr int kFaceUpSamples = 8;
+            constexpr int kUprightSamples = 8;
 
             while (true) {
                 Qmi8658::AccelData accel;
@@ -335,25 +469,29 @@ private:
 
                 bool face_down = self->normal_z_sign_ > 0 ? accel.z < -kFlatZThresholdG : accel.z > kFlatZThresholdG;
                 bool face_up = self->normal_z_sign_ > 0 ? accel.z > kFlatZThresholdG : accel.z < -kFlatZThresholdG;
-                bool flat_and_still = face_up && delta < kStillDeltaThresholdG;
+                bool upright = std::fabs(accel.z) < kUprightZThresholdG;
                 bool tilt_left = accel.x < kTiltLeftThresholdG && std::fabs(accel.z) < 0.9f;
 
                 if (face_down) {
                     face_down_samples++;
                     face_up_samples = 0;
-                    still_flat_samples = 0;
                 } else if (face_up) {
                     face_up_samples++;
                     face_down_samples = 0;
-                    if (flat_and_still && !self->face_down_muted_ && !self->temporary_motion_emotion_) {
-                        still_flat_samples++;
-                    } else {
-                        still_flat_samples = 0;
-                    }
                 } else {
                     face_down_samples = 0;
                     face_up_samples = 0;
-                    still_flat_samples = 0;
+                }
+
+                upright_samples = upright
+                    ? std::min(upright_samples + 1, kUprightSamples)
+                    : std::max(upright_samples - 1, 0);
+                bool upright_clock = self->upright_clock_active_
+                    ? upright_samples > 0
+                    : upright_samples >= kUprightSamples;
+                if (upright_clock != self->upright_clock_active_) {
+                    self->upright_clock_active_ = upright_clock;
+                    self->ApplyPostureVisual();
                 }
 
                 if (face_down_samples >= kFaceDownSamples && !self->face_down_muted_) {
@@ -362,9 +500,6 @@ private:
                 if (face_up_samples >= kFaceUpSamples && self->face_down_muted_) {
                     self->SetFaceDownMuted(false);
                     self->WakeFromMotion();
-                }
-                if (still_flat_samples >= kStillFlatSamples && !self->motion_sleeping_) {
-                    self->EnterMotionSleep();
                 }
                 if (tilt_left != self->tilt_left_active_ && !self->face_down_muted_ && !self->temporary_motion_emotion_) {
                     self->tilt_left_active_ = tilt_left;
@@ -394,10 +529,18 @@ private:
             }
 
             if (motion_sleeping_) {
+                static_cast<MotionAwareNoAudioCodecSimplex*>(GetAudioCodec())->SetSleepMuted(true);
                 display_->SetPowerSaveMode(true);
                 display_->SetEmotion(kSleepEmotion);
                 display_->SetChatMessage("system", "");
-                GetBacklight()->SetBrightness(12);
+                GetBacklight()->SetBrightness(30);
+                SetMotionEmotionOffset(0);
+                return;
+            }
+
+            if (upright_clock_active_ && motion_emote_display_ != nullptr) {
+                motion_emote_display_->SetClockMode(true);
+                display_->SetChatMessage("system", "");
                 SetMotionEmotionOffset(0);
                 return;
             }
@@ -411,10 +554,16 @@ private:
 
     void WakeFromMotion() {
         motion_sleeping_ = false;
+        static_cast<MotionAwareNoAudioCodecSimplex*>(GetAudioCodec())->SetSleepMuted(false);
         power_save_timer_->WakeUp();
         auto& app = Application::GetInstance();
         app.Schedule([this]() {
             if (display_ != nullptr && !face_down_muted_) {
+                if (upright_clock_active_ && motion_emote_display_ != nullptr) {
+                    motion_emote_display_->SetClockMode(true);
+                    display_->SetChatMessage("system", "");
+                    return;
+                }
                 display_->SetPowerSaveMode(false);
                 display_->SetEmotion(kAwakeEmotion);
                 display_->SetChatMessage("system", "");
@@ -425,8 +574,8 @@ private:
     }
 
     void EnterMotionSleep() {
-        auto state = Application::GetInstance().GetDeviceState();
-        if (state != kDeviceStateIdle) {
+        auto& app = Application::GetInstance();
+        if (!app.CanEnterSleepMode()) {
             return;
         }
         ESP_LOGI(TAG, "Motion sleep: flat and still");
@@ -502,23 +651,22 @@ private:
             while (true) {
                 esp_lcd_touch_read_data(touch);
 
-                uint16_t x = 0;
-                uint16_t y = 0;
+                esp_lcd_touch_point_data_t point = {};
                 uint8_t point_count = 0;
-                bool pressed = esp_lcd_touch_get_coordinates(touch, &x, &y, nullptr, &point_count, 1);
+                bool pressed = esp_lcd_touch_get_data(touch, &point, &point_count, 1) == ESP_OK && point_count > 0;
 
-                if (pressed && point_count > 0 && !was_pressed) {
+                if (pressed && !was_pressed) {
                     int64_t now_ms = esp_timer_get_time() / 1000;
                     if ((now_ms - last_click_ms) > 500) {
                         last_click_ms = now_ms;
-                        ESP_LOGI(TAG, "Touch wake at x=%u, y=%u", x, y);
+                        ESP_LOGI(TAG, "Touch wake at x=%u, y=%u", point.x, point.y);
                         auto& app = Application::GetInstance();
                         app.Schedule([&app]() {
                             app.ToggleChatState();
                         });
                     }
                 }
-                was_pressed = pressed && point_count > 0;
+                was_pressed = pressed;
                 vTaskDelay(pdMS_TO_TICKS(40));
             }
         }, "touch_wake", 3072, tp, 3, &touch_task_handle_);
@@ -699,7 +847,12 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeTools();
-        GetBacklight()->RestoreBrightness();
+        Settings display_settings("display");
+        if (display_settings.GetInt("brightness", -1) < 0) {
+            GetBacklight()->SetBrightness(95, true);
+        } else {
+            GetBacklight()->RestoreBrightness();
+        }
     }
 
     virtual AudioCodec* GetAudioCodec() override {

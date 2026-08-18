@@ -20,7 +20,7 @@
                 "CONFIG_BOARD_TYPE_XIAOZHIWAVE_ESP32_S3_TOUCH_LCD_2=y",
                 "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y",
                 "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/16m_6m_4m_assets.csv\"",
-                "CONFIG_OTA_URL=\"http://xz.atchain.cn/ota/\""
+                "CONFIG_OTA_URL=\"https://api.tenclass.net/xiaozhi/ota/\""
             ]
         }
     ]

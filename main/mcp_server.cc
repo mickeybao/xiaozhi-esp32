@@ -99,6 +99,11 @@ public:
         return was_active ? "Timer cancelled" : "No active timer";
     }
 
+    bool IsRunning() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return active_;
+    }
+
 private:
     static constexpr int kMaxDurationSeconds = 24 * 60 * 60;
     static constexpr int64_t kSecondUs = 1000000;
@@ -251,10 +256,7 @@ public:
         if (stream_url.empty()) {
             auto resolved = ResolvePresetUrl(station_name);
             if (resolved.empty()) {
-                resolved = ResolveStationUrl(station_name);
-            }
-            if (resolved.empty()) {
-                return "没有找到可直接播放的 Ogg Opus 电台。可以换一个电台名称，或在后台把 MP3/AAC 电台转码成 Ogg Opus。";
+                return "未找到内置电台。请选择音乐、新闻、交通或天气类电台，也可以说具体电台名称。";
             }
             stream_url = resolved;
         }
@@ -314,13 +316,11 @@ public:
 
     std::string List(const std::string& name, const std::string& country,
                      const std::string& language, const std::string& tag) {
-        if (country.empty() && language.empty() && tag.empty()) {
-            auto presets = ListPresetStations(name);
-            if (!presets.empty()) {
-                return presets;
-            }
-        }
-        return ListStations(name, country, language, tag);
+        (void)country;
+        (void)language;
+        (void)tag;
+        auto presets = ListPresetStations(name);
+        return presets.empty() ? "未找到匹配的内置电台。可选分类：音乐、新闻、交通、天气。" : presets;
     }
 
 private:
@@ -333,13 +333,17 @@ private:
     static constexpr RadioPreset kPresets[] = {
         {"中国之声", "中央广播 中国之声 CNR1 新闻台", "https://lhttp.qtfm.cn/live/15318317/64k.mp3"},
         {"国际新闻", "国际新闻 新闻台", "https://lhttp.qtfm.cn/live/20500172/64k.mp3"},
-        {"怀集音乐之声", "怀集 音乐之声 音乐台", "https://lhttp.qingting.fm/live/4804/64k.mp3"},
+        {"美国新闻", "美国新闻 新闻台", "https://tunein.cdnstream1.com/2868_96.mp3"},
+        {"上海新闻广播", "上海新闻广播 上海新闻 新闻台", "https://lhttp.qingting.fm/live/270/64k.mp3"},
+        {"长三角之声", "长三角之声 新闻台", "https://lhttp.qingting.fm/live/275/64k.mp3"},
+        {"第一财经广播", "第一财经广播 第一财经 新闻台", "https://lhttp.qingting.fm/live/276/64k.mp3"},
+        {"音乐之声", "音乐之声 音乐台", "https://lhttp.qingting.fm/live/4804/64k.mp3"},
         {"清晨音乐台", "清晨 音乐台", "http://lhttp.qingting.fm/live/4915/64k.mp3"},
-        {"80后音悦台", "80后 八零后 音悦台", "http://lhttp.qingting.fm/live/20207761/64k.mp3"},
         {"两广之声音乐台", "两广之声 两广 音乐台", "https://lhttp.qtfm.cn/live/20500149/64k.mp3"},
         {"动听音乐台", "动听 音乐台", "https://lhttp-hw.qtfm.cn/live/5022107/64k.mp3"},
-        {"Chinese Classical Music", "中文民乐 中国民乐 民乐", "https://radio.chinesemusicworld.com/chinesemusic.mp3"},
-        {"REPLAY NEWS 中文", "Replay News 中文新闻 新闻台", "https://replaynewszh.ice.infomaniak.ch/replaynewszh-128.mp3"},
+        {"中国流行民乐", "中国流行民乐 中国民乐 流行民乐 民乐 音乐台", "https://radio.chinesemusicworld.com/chinesemusic.mp3"},
+        {"上海交通广播", "上海交通广播 上海交通 交通台", "http://lhttp.qingting.fm/live/266/64k.mp3"},
+        {"上海天气台", "上海天气台 上海天气 天气台", "https://lhttp.qtfm.cn/live/20500176/64k.mp3"},
     };
 
     std::mutex mutex_;
@@ -373,6 +377,18 @@ private:
                 return preset.url;
             }
         }
+        if (ContainsIgnoreCase(name, "音乐")) {
+            return kPresets[6].url;
+        }
+        if (ContainsIgnoreCase(name, "新闻")) {
+            return kPresets[0].url;
+        }
+        if (ContainsIgnoreCase(name, "交通")) {
+            return kPresets[11].url;
+        }
+        if (ContainsIgnoreCase(name, "天气")) {
+            return kPresets[12].url;
+        }
         return "";
     }
 
@@ -390,7 +406,7 @@ private:
             result += "\n" + std::to_string(++count) + ". " + preset.name;
         }
         if (!result.empty()) {
-            result += "\n可以直接说：播放中国之声、国际新闻、80后音悦台或中文民乐。";
+            result += "\n可按音乐、新闻、交通、天气分类播放，也可以直接说电台名称。";
         }
         return result;
     }
@@ -613,7 +629,7 @@ private:
             if (read > 0) {
                 input_total += read;
             }
-            bool trace_read = read_count <= 20 || read_count % 50 == 0 || read <= 0;
+            bool trace_read = read_count <= 3 || read_count % 500 == 0 || read <= 0;
             if (trace_read) {
                 ESP_LOGI(TAG, "MP3-DIAG read#%lu bytes=%d input_total=%u stop=%d",
                          static_cast<unsigned long>(read_count), read, static_cast<unsigned>(input_total),
@@ -644,7 +660,7 @@ private:
                 };
                 result = esp_audio_simple_dec_process(decoder, &raw, &frame);
                 ++decode_count;
-                bool trace_decode = decode_count <= 20 || decode_count % 50 == 0 || result != ESP_AUDIO_ERR_OK;
+                bool trace_decode = decode_count <= 3 || decode_count % 500 == 0 || result != ESP_AUDIO_ERR_OK;
                 if (trace_decode) {
                     ESP_LOGI(TAG, "MP3-DIAG decode#%lu result=%d raw_len=%lu consumed=%lu decoded=%lu needed=%lu out_cap=%u",
                              static_cast<unsigned long>(decode_count), result, static_cast<unsigned long>(raw.len),
@@ -773,6 +789,17 @@ private:
             url = url_;
             name = name_;
             stream_id = stream_id_;
+        }
+
+        if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
+            ESP_LOGI(TAG, "Waiting for assistant speech to finish before starting radio");
+        }
+        while (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking && !ShouldStop(stream_id)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (ShouldStop(stream_id)) {
+            MarkStopped(stream_id);
+            return;
         }
 
         struct ConnectionCandidate {
@@ -923,6 +950,14 @@ private:
 
 } // namespace
 
+bool IsVoiceTimerRunning() {
+    return VoiceTimerManager::GetInstance().IsRunning();
+}
+
+void CancelVoiceTimer() {
+    VoiceTimerManager::GetInstance().Cancel();
+}
+
 bool IsRadioPlaying() {
     return RadioStreamManager::GetInstance().IsRunning();
 }
@@ -1000,34 +1035,26 @@ void McpServer::AddCommonTools() {
 
     AddTool("self.radio.play",
         "Play an internet radio stream on the device. Use this when the user asks to play internet radio, 网络收音机, 电台, or 在线电台. "
-        "If url is empty, first match a built-in Chinese MP3 station by name, then search a public radio directory. "
-        "Built-in choices include 中国之声, 国际新闻, music stations, and Chinese classical music. "
+        "Only use the built-in stations; never search the web or invent a station URL. "
+        "The four built-in categories are 音乐, 新闻, 交通, and 天气. Pass the requested category or exact station name in name. "
         "The firmware directly plays MP3 and Ogg Opus streams; AAC/AAC+ is not supported yet.",
         PropertyList({
-            Property("url", kPropertyTypeString, std::string("")),
             Property("name", kPropertyTypeString, std::string("网络收音机"))
         }),
         [](const PropertyList& properties) -> ReturnValue {
-            auto url = properties["url"].value<std::string>();
             auto name = properties["name"].value<std::string>();
-            return RadioStreamManager::GetInstance().Start(url, name);
+            return RadioStreamManager::GetInstance().Start("", name);
         });
 
     AddTool("self.radio.list",
         "List playable internet radio stations. Use this when the user asks what stations are available, 有哪些电台, 推荐几个电台, "
-        "or wants to test radio playback but does not know station names. With no filters this returns built-in Chinese MP3 stations.",
+        "or wants to test radio playback but does not know station names. This only returns built-in stations and never searches the web.",
         PropertyList({
-            Property("name", kPropertyTypeString, std::string("")),
-            Property("country", kPropertyTypeString, std::string("")),
-            Property("language", kPropertyTypeString, std::string("")),
-            Property("tag", kPropertyTypeString, std::string(""))
+            Property("name", kPropertyTypeString, std::string(""))
         }),
         [](const PropertyList& properties) -> ReturnValue {
             auto name = properties["name"].value<std::string>();
-            auto country = properties["country"].value<std::string>();
-            auto language = properties["language"].value<std::string>();
-            auto tag = properties["tag"].value<std::string>();
-            return RadioStreamManager::GetInstance().List(name, country, language, tag);
+            return RadioStreamManager::GetInstance().List(name, "", "", "");
         });
 
     AddTool("self.radio.stop",

@@ -320,7 +320,7 @@ void AudioService::AudioOutputTask() {
             sum_abs += static_cast<uint64_t>(sample < 0 ? -static_cast<int32_t>(sample) : sample);
             nonzero_samples += sample != 0;
         }
-        bool trace_output = output_task_count <= 20 || output_task_count % 50 == 0;
+        bool trace_output = output_task_count <= 3 || output_task_count % 500 == 0;
         if (trace_output) {
             ESP_LOGI(TAG, "OUTPUT-DIAG #%lu samples=%u nonzero=%u min=%d max=%d avg_abs=%u enabled=%d volume=%d",
                      static_cast<unsigned long>(output_task_count), static_cast<unsigned>(task->pcm.size()),

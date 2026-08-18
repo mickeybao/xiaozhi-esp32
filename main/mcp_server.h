@@ -15,6 +15,8 @@
 
 bool IsRadioPlaying();
 void StopRadioPlayback(bool update_display = false);
+bool IsVoiceTimerRunning();
+void CancelVoiceTimer();
 
 class ImageContent {
 private:

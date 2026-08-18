@@ -341,8 +341,8 @@ void Application::ActivationTask() {
         Board::GetInstance().GetDisplay()->SetEmotion("thinking");
     });
 
-    // Check for new firmware version
-    SetStartupMessage("检查更新", "[启动] 正在连接升级服务器...");
+    // Fetch activation and protocol configuration, but never auto-upgrade at boot.
+    SetStartupMessage("连接服务", "[启动] 正在获取设备连接配置...");
     CheckNewVersion();
 
     // Check for new assets version
@@ -488,15 +488,13 @@ void Application::CheckNewVersion() {
         retry_count = 0;
 
         if (ota_->HasNewVersion()) {
-            if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
-                return; // This line will never be reached after reboot
-            }
-            // If upgrade failed, continue to normal operation
+            ESP_LOGI(TAG, "New firmware %s is available; automatic startup upgrade is disabled",
+                     ota_->GetFirmwareVersion().c_str());
         }
 
         // No new version, mark the current version as valid
         ota_->MarkCurrentVersionValid();
-        SetStartupMessage("检查更新", "[启动] 固件检查完成，当前已是最新版本");
+        SetStartupMessage("连接服务", "[启动] 设备连接配置获取完成");
         if (!ota_->HasActivationCode() && !ota_->HasActivationChallenge()) {
             // Exit the loop if done checking new version
             break;
@@ -730,12 +728,36 @@ void Application::StopListening() {
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
 
+    if (IsVoiceTimerRunning()) {
+        ESP_LOGI(TAG, "Cancelling voice timer from touch/button interaction");
+        CancelVoiceTimer();
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetStatus(Lang::Strings::LISTENING);
+        display->SetChatMessage("system", "倒计时已取消，可以继续对话");
+        if (state == kDeviceStateListening && protocol_) {
+            protocol_->SendStartListening(listening_mode_);
+            audio_service_.EnableVoiceProcessing(true);
+        } else {
+            StartListening();
+        }
+        return;
+    }
+
     if (IsRadioPlaying()) {
         ESP_LOGI(TAG, "Stopping radio from touch/button interaction");
         StopRadioPlayback(false);
         auto display = Board::GetInstance().GetDisplay();
-        display->SetStatus(state == kDeviceStateListening ? Lang::Strings::LISTENING : Lang::Strings::STANDBY);
         display->SetChatMessage("system", "网络收音机已停止，可以继续对话");
+        if (state == kDeviceStateListening && protocol_) {
+            display->SetStatus(Lang::Strings::LISTENING);
+            protocol_->SendStartListening(listening_mode_);
+            audio_service_.EnableVoiceProcessing(true);
+            ESP_LOGI(TAG, "Radio stopped; voice processing resumed");
+        } else {
+            display->SetStatus(Lang::Strings::LISTENING);
+            StartListening();
+            ESP_LOGI(TAG, "Radio stopped; switching to listening state");
+        }
         return;
     }
     
@@ -951,8 +973,10 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
-            // Make sure the audio processor is running
-            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
+            if (IsRadioPlaying()) {
+                ESP_LOGI(TAG, "Radio is active; keep voice processing paused until user stops radio");
+                audio_service_.EnableVoiceProcessing(false);
+            } else if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
                 // For auto mode, wait for playback queue to be empty before enabling voice processing
                 // This prevents audio truncation when STOP arrives late due to network jitter
                 if (listening_mode_ == kListeningModeAutoStop) {
@@ -1128,6 +1152,10 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
 }
 
 bool Application::CanEnterSleepMode() {
+    if (IsRadioPlaying()) {
+        return false;
+    }
+
     if (GetDeviceState() != kDeviceStateIdle) {
         return false;
     }
