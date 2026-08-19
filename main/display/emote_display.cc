@@ -29,6 +29,7 @@
 #include "gfx.h"
 #include "expression_emote.h"
 #include "application.h"
+#include "mcp_server.h"
 #include "font_awesome.h"
 
 
@@ -253,8 +254,9 @@ void EmoteDisplay::UpdateStatusBar(bool update_all)
     }
 
     auto state = Application::GetInstance().GetDeviceState();
-    if (state == kDeviceStateIdle || state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring ||
-        state == kDeviceStateActivating) {
+    if (!IsRadioPlaying() &&
+        (state == kDeviceStateIdle || state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring ||
+         state == kDeviceStateActivating)) {
         const char* network_icon = board.GetNetworkStateIcon();
         const char* icon_name = GetNetworkIconAssetName(network_icon);
         network_text_ = IsWifiIcon(network_icon) ? "WiFi" : "4G";

@@ -13,11 +13,13 @@ public:
     ~Ota();
 
     esp_err_t CheckVersion();
+    esp_err_t SyncServerTime();
     esp_err_t Activate();
     bool HasActivationChallenge() { return has_activation_challenge_; }
     bool HasNewVersion() { return has_new_version_; }
     bool HasMqttConfig() { return has_mqtt_config_; }
     bool HasWebsocketConfig() { return has_websocket_config_; }
+    bool HasCachedProtocolConfig() const { return has_cached_protocol_config_; }
     bool HasActivationCode() { return has_activation_code_; }
     bool HasServerTime() { return has_server_time_; }
     bool StartUpgrade(std::function<void(int progress, size_t speed)> callback);
@@ -37,6 +39,7 @@ private:
     bool has_new_version_ = false;
     bool has_mqtt_config_ = false;
     bool has_websocket_config_ = false;
+    bool has_cached_protocol_config_ = false;
     bool has_server_time_ = false;
     bool has_activation_code_ = false;
     bool has_serial_number_ = false;
@@ -53,6 +56,7 @@ private:
     bool IsNewVersionAvailable(const std::string& currentVersion, const std::string& newVersion);
     std::string GetActivationPayload();
     std::unique_ptr<Http> SetupHttp();
+    void LoadCachedProtocolConfig();
 };
 
 #endif // _OTA_H

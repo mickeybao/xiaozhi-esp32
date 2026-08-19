@@ -87,9 +87,8 @@ void Application::Initialize() {
 
     // Add state change listeners
     state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
-        if (old_state == kDeviceStateListening && new_state == kDeviceStateSpeaking) {
-            StopRadioPlayback(false);
-        }
+        (void)old_state;
+        (void)new_state;
         xEventGroupSetBits(event_group_, MAIN_EVENT_STATE_CHANGED);
     });
 
@@ -189,6 +188,7 @@ void Application::Run() {
         MAIN_EVENT_NETWORK_CONNECTED |
         MAIN_EVENT_NETWORK_DISCONNECTED |
         MAIN_EVENT_TOGGLE_CHAT |
+        MAIN_EVENT_TOUCH_INTERACTION |
         MAIN_EVENT_START_LISTENING |
         MAIN_EVENT_STOP_LISTENING |
         MAIN_EVENT_ACTIVATION_DONE |
@@ -220,6 +220,10 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_TOGGLE_CHAT) {
             HandleToggleChatEvent();
+        }
+
+        if (bits & MAIN_EVENT_TOUCH_INTERACTION) {
+            HandleTouchInteractionEvent();
         }
 
         if (bits & MAIN_EVENT_START_LISTENING) {
@@ -341,9 +345,16 @@ void Application::ActivationTask() {
         Board::GetInstance().GetDisplay()->SetEmotion("thinking");
     });
 
-    // Fetch activation and protocol configuration, but never auto-upgrade at boot.
-    SetStartupMessage("连接服务", "[启动] 正在获取设备连接配置...");
-    CheckNewVersion();
+    if (ota_->HasCachedProtocolConfig()) {
+        ESP_LOGI(TAG, "Using cached protocol configuration; skipping startup OTA request");
+        SetStartupMessage("连接服务", "[启动] 使用已保存的连接配置...");
+        ota_->MarkCurrentVersionValid();
+        ota_->SyncServerTime();
+    } else {
+        // First activation still needs the server to provide protocol credentials.
+        SetStartupMessage("连接服务", "[启动] 首次获取设备连接配置...");
+        CheckNewVersion();
+    }
 
     // Check for new assets version
     SetStartupMessage("检查资源", "[启动] 正在检查表情资源包...");
@@ -575,7 +586,29 @@ void Application::InitializeProtocol() {
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
+        if (discard_cancelled_listening_response_.load() && GetDeviceState() == kDeviceStateIdle &&
+            cJSON_IsString(type)) {
+            bool is_tts = strcmp(type->valuestring, "tts") == 0;
+            auto tts_state = is_tts ? cJSON_GetObjectItem(root, "state") : nullptr;
+            bool is_tts_stop = cJSON_IsString(tts_state) && strcmp(tts_state->valuestring, "stop") == 0;
+            bool is_cancelled_conversation_message = strcmp(type->valuestring, "stt") == 0 ||
+                strcmp(type->valuestring, "llm") == 0 || strcmp(type->valuestring, "mcp") == 0 ||
+                (is_tts && !is_tts_stop);
+            if (is_cancelled_conversation_message) {
+                ESP_LOGI(TAG, "Ignoring late %s after user stopped listening", type->valuestring);
+                return;
+            }
+        }
         if (strcmp(type->valuestring, "tts") == 0) {
+            if (IsRadioPlaying()) {
+                auto state = cJSON_GetObjectItem(root, "state");
+                const char* tts_state = cJSON_IsString(state) ? state->valuestring : "unknown";
+                if (strcmp(tts_state, "stop") != 0) {
+                    ESP_LOGI(TAG, "Ignoring server TTS while radio is playing: %s", tts_state);
+                    return;
+                }
+                ESP_LOGI(TAG, "Allowing TTS stop to finish the radio-start confirmation");
+            }
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
@@ -717,6 +750,10 @@ void Application::ToggleChatState() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT);
 }
 
+void Application::TouchInteraction() {
+    xEventGroupSetBits(event_group_, MAIN_EVENT_TOUCH_INTERACTION);
+}
+
 void Application::StartListening() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING);
 }
@@ -797,6 +834,61 @@ void Application::HandleToggleChatEvent() {
     }
 }
 
+void Application::HandleTouchInteractionEvent() {
+    auto state = GetDeviceState();
+    auto display = Board::GetInstance().GetDisplay();
+
+    auto enter_listening = [this, state, display]() {
+        ListeningMode mode = GetDefaultListeningMode();
+        if (state == kDeviceStateListening && protocol_) {
+            listening_mode_ = mode;
+            display->SetStatus(Lang::Strings::LISTENING);
+            protocol_->SendStartListening(listening_mode_);
+            audio_service_.EnableVoiceProcessing(true);
+            return;
+        }
+        if (state == kDeviceStateIdle) {
+            if (!protocol_) {
+                ESP_LOGE(TAG, "Protocol not initialized");
+                return;
+            }
+            if (!protocol_->IsAudioChannelOpened()) {
+                SetDeviceState(kDeviceStateConnecting);
+                Schedule([this, mode]() {
+                    ContinueOpenAudioChannel(mode);
+                });
+                return;
+            }
+            SetListeningMode(mode);
+        } else if (state == kDeviceStateSpeaking) {
+            AbortSpeaking(kAbortReasonNone);
+            SetListeningMode(mode);
+        }
+    };
+
+    if (IsVoiceTimerRunning()) {
+        ESP_LOGI(TAG, "Cancelling voice timer from touchscreen interaction");
+        CancelVoiceTimer();
+        display->SetChatMessage("system", "倒计时已取消，可以继续对话");
+        enter_listening();
+        return;
+    }
+
+    if (IsRadioPlaying()) {
+        ESP_LOGI(TAG, "Stopping radio from touchscreen interaction");
+        StopRadioPlayback(false);
+        display->SetChatMessage("system", "网络收音机已停止，可以继续对话");
+        enter_listening();
+        return;
+    }
+
+    if (state == kDeviceStateSpeaking || state == kDeviceStateIdle) {
+        enter_listening();
+    } else if (state == kDeviceStateListening) {
+        HandleStopListeningEvent();
+    }
+}
+
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
@@ -857,6 +949,7 @@ void Application::HandleStopListeningEvent() {
         SetDeviceState(kDeviceStateWifiConfiguring);
         return;
     } else if (state == kDeviceStateListening) {
+        discard_cancelled_listening_response_ = true;
         if (protocol_) {
             protocol_->SendStopListening();
         }
@@ -1039,6 +1132,7 @@ void Application::AbortSpeaking(AbortReason reason) {
 }
 
 void Application::SetListeningMode(ListeningMode mode) {
+    discard_cancelled_listening_response_ = false;
     listening_mode_ = mode;
     SetDeviceState(kDeviceStateListening);
 }

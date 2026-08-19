@@ -7,6 +7,7 @@
 #include <freertos/task.h>
 #include <cJSON.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
@@ -18,6 +19,7 @@
 #endif
 
 #include <cstring>
+#include <cstdio>
 #include <vector>
 #include <sstream>
 #include <algorithm>
@@ -26,6 +28,7 @@
 
 
 Ota::Ota() {
+    current_version_ = esp_app_get_description()->version;
 #ifdef ESP_EFUSE_BLOCK_USR_DATA
     // Read Serial Number from efuse user_data
     uint8_t serial_number[33] = {0};
@@ -38,9 +41,35 @@ Ota::Ota() {
         }
     }
 #endif
+    LoadCachedProtocolConfig();
 }
 
 Ota::~Ota() {
+}
+
+void Ota::LoadCachedProtocolConfig() {
+    Settings mqtt_settings("mqtt", false);
+    std::string mqtt_endpoint = mqtt_settings.GetString("endpoint");
+    std::string mqtt_client_id = mqtt_settings.GetString("client_id");
+    std::string mqtt_publish_topic = mqtt_settings.GetString("publish_topic");
+    has_mqtt_config_ = !mqtt_endpoint.empty() && !mqtt_client_id.empty() && !mqtt_publish_topic.empty();
+
+    Settings websocket_settings("websocket", false);
+    std::string websocket_url = websocket_settings.GetString("url");
+    has_websocket_config_ = !websocket_url.empty();
+    has_cached_protocol_config_ = has_mqtt_config_ || has_websocket_config_;
+
+    if (has_mqtt_config_) {
+        ESP_LOGI(TAG, "Cached MQTT configuration found, endpoint=%s", mqtt_endpoint.c_str());
+    }
+    if (has_websocket_config_) {
+        size_t query_pos = websocket_url.find('?');
+        std::string safe_url = websocket_url.substr(0, query_pos);
+        ESP_LOGI(TAG, "Cached WebSocket configuration found, url=%s", safe_url.c_str());
+    }
+    if (!has_cached_protocol_config_) {
+        ESP_LOGI(TAG, "No valid cached protocol configuration found");
+    }
 }
 
 std::string Ota::GetCheckVersionUrl() {
@@ -71,12 +100,92 @@ std::unique_ptr<Http> Ota::SetupHttp() {
     return http;
 }
 
+esp_err_t Ota::SyncServerTime() {
+    std::string url = GetCheckVersionUrl();
+    if (url.length() < 10) {
+        ESP_LOGE(TAG, "Time sync URL is not properly set");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "Time sync started: %s", url.c_str());
+    auto http = SetupHttp();
+    http->SetTimeout(10000);
+    if (!http->Open("HEAD", url)) {
+        int error = http->GetLastError();
+        ESP_LOGW(TAG, "Time sync HTTP request failed: %d", error);
+        return error == 0 ? ESP_FAIL : static_cast<esp_err_t>(error);
+    }
+
+    int status_code = http->GetStatusCode();
+    std::string date = http->GetResponseHeader("Date");
+    if (date.empty()) {
+        date = http->GetResponseHeader("date");
+    }
+    http->Close();
+    if (status_code < 200 || status_code >= 400 || date.empty()) {
+        ESP_LOGW(TAG, "Time sync response invalid: status=%d date=%s",
+                 status_code, date.empty() ? "missing" : date.c_str());
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    char weekday[4] = {};
+    char month_name[4] = {};
+    char timezone[4] = {};
+    int day = 0;
+    int year = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    if (sscanf(date.c_str(), "%3s, %d %3s %d %d:%d:%d %3s",
+               weekday, &day, month_name, &year, &hour, &minute, &second, timezone) != 8) {
+        ESP_LOGW(TAG, "Failed to parse HTTP Date header: %s", date.c_str());
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    static constexpr const char* kMonthNames[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    int month = 0;
+    while (month < 12 && strcmp(month_name, kMonthNames[month]) != 0) {
+        ++month;
+    }
+    if (month == 12 || year < 2024 || day < 1 || day > 31 ||
+        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60) {
+        ESP_LOGW(TAG, "HTTP Date header contains invalid values: %s", date.c_str());
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    // Convert the UTC calendar date to Unix time without relying on the process TZ.
+    int adjusted_year = year - (month < 2 ? 1 : 0);
+    int era = (adjusted_year >= 0 ? adjusted_year : adjusted_year - 399) / 400;
+    unsigned year_of_era = static_cast<unsigned>(adjusted_year - era * 400);
+    unsigned adjusted_month = static_cast<unsigned>(month + (month > 1 ? -2 : 10));
+    unsigned day_of_year = (153 * adjusted_month + 2) / 5 + static_cast<unsigned>(day - 1);
+    unsigned day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    int64_t days_since_epoch = static_cast<int64_t>(era) * 146097 + day_of_era - 719468;
+
+    Settings time_settings("system", false);
+    int timezone_offset_minutes = time_settings.GetInt("timezone_offset", 480);
+    int64_t unix_seconds = days_since_epoch * 86400 + hour * 3600 + minute * 60 + second;
+    unix_seconds += static_cast<int64_t>(timezone_offset_minutes) * 60;
+
+    struct timeval tv = {};
+    tv.tv_sec = static_cast<time_t>(unix_seconds);
+    settimeofday(&tv, nullptr);
+    has_server_time_ = true;
+    ESP_LOGI(TAG, "Time sync success: %s, timezone offset=%d minutes",
+             date.c_str(), timezone_offset_minutes);
+    return ESP_OK;
+}
+
 /* 
  * Specification: https://ccnphfhqs21z.feishu.cn/wiki/FjW6wZmisimNBBkov6OcmfvknVd
  */
 esp_err_t Ota::CheckVersion() {
     auto& board = Board::GetInstance();
     auto app_desc = esp_app_get_description();
+    int64_t request_started_us = esp_timer_get_time();
 
     // Check if there is a new firmware version available
     current_version_ = app_desc->version;
@@ -92,22 +201,34 @@ esp_err_t Ota::CheckVersion() {
 
     std::string data = board.GetSystemInfoJson();
     std::string method = data.length() > 0 ? "POST" : "GET";
+    ESP_LOGI(TAG, "Configuration request: method=%s url=%s payload=%u bytes network=%s",
+             method.c_str(), url.c_str(), static_cast<unsigned>(data.size()),
+             board.GetDeviceStatusJson().c_str());
     http->SetContent(std::move(data));
 
     if (!http->Open(method, url)) {
         int last_error = http->GetLastError();
-        ESP_LOGE(TAG, "Failed to open HTTP connection, code=0x%x", last_error);
+        int64_t elapsed_ms = (esp_timer_get_time() - request_started_us) / 1000;
+        ESP_LOGE(TAG, "Configuration HTTP open failed: error=%d elapsed=%lldms network=%s",
+                 last_error, static_cast<long long>(elapsed_ms), board.GetDeviceStatusJson().c_str());
         return last_error;
     }
 
     auto status_code = http->GetStatusCode();
     if (status_code != 200) {
-        ESP_LOGE(TAG, "Failed to check version, status code: %d", status_code);
+        int last_error = http->GetLastError();
+        int64_t elapsed_ms = (esp_timer_get_time() - request_started_us) / 1000;
+        ESP_LOGE(TAG, "Configuration HTTP response failed: status=%d modem_error=%d elapsed=%lldms network=%s",
+                 status_code, last_error, static_cast<long long>(elapsed_ms), board.GetDeviceStatusJson().c_str());
+        http->Close();
         return status_code;
     }
 
     data = http->ReadAll();
     http->Close();
+    ESP_LOGI(TAG, "Configuration response received: bytes=%u elapsed=%lldms",
+             static_cast<unsigned>(data.size()),
+             static_cast<long long>((esp_timer_get_time() - request_started_us) / 1000));
 
     // Response: { "firmware": { "version": "1.0.0", "url": "http://" } }
     // Parse the JSON response and check if the version is newer
@@ -144,6 +265,7 @@ esp_err_t Ota::CheckVersion() {
     }
 
     has_mqtt_config_ = false;
+    has_cached_protocol_config_ = false;
     cJSON *mqtt = cJSON_GetObjectItem(root, "mqtt");
     if (cJSON_IsObject(mqtt)) {
         Settings settings("mqtt", true);
@@ -160,6 +282,10 @@ esp_err_t Ota::CheckVersion() {
             }
         }
         has_mqtt_config_ = true;
+        has_cached_protocol_config_ = true;
+        cJSON* endpoint = cJSON_GetObjectItem(mqtt, "endpoint");
+        ESP_LOGI(TAG, "MQTT configuration saved, endpoint=%s",
+                 cJSON_IsString(endpoint) ? endpoint->valuestring : "unknown");
     } else {
         ESP_LOGI(TAG, "No mqtt section found !");
     }
@@ -181,6 +307,11 @@ esp_err_t Ota::CheckVersion() {
             }
         }
         has_websocket_config_ = true;
+        has_cached_protocol_config_ = true;
+        cJSON* url_item = cJSON_GetObjectItem(websocket, "url");
+        std::string safe_url = cJSON_IsString(url_item) ? url_item->valuestring : "unknown";
+        safe_url = safe_url.substr(0, safe_url.find('?'));
+        ESP_LOGI(TAG, "WebSocket configuration saved, url=%s", safe_url.c_str());
     } else {
         ESP_LOGI(TAG, "No websocket section found!");
     }
@@ -231,6 +362,8 @@ esp_err_t Ota::CheckVersion() {
             // 如果有时区偏移，计算本地时间
             if (cJSON_IsNumber(timezone_offset)) {
                 ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
+                Settings time_settings("system", true);
+                time_settings.SetInt("timezone_offset", timezone_offset->valueint);
             }
             
             tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
