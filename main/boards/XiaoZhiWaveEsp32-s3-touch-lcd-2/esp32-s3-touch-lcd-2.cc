@@ -546,9 +546,9 @@ private:
             constexpr uint8_t kMinimumStableSamples = 1;
             constexpr int kMaximumCoordinateDrift = 60;
             constexpr int64_t kMinimumPressMs = 0;
-            constexpr int64_t kMaximumPressMs = 800;
+            constexpr int64_t kMaximumPressMs = 1200;
             constexpr int64_t kMinimumDoubleTapGapMs = 60;
-            constexpr int64_t kMaximumDoubleTapGapMs = 600;
+            constexpr int64_t kMaximumDoubleTapGapMs = 800;
             constexpr int64_t kActionCooldownMs = 500;
 
             while (true) {
@@ -557,7 +557,7 @@ private:
                     was_pressed = false;
                     candidate_valid = false;
                     stable_samples = 0;
-                    vTaskDelay(pdMS_TO_TICKS(40));
+                    vTaskDelay(pdMS_TO_TICKS(20));
                     continue;
                 }
 
@@ -618,7 +618,7 @@ private:
                     stable_samples = 0;
                 }
                 was_pressed = pressed;
-                vTaskDelay(pdMS_TO_TICKS(40));
+                vTaskDelay(pdMS_TO_TICKS(20));
             }
         }, "touch_wake", 3072, this, 3, &touch_task_handle_);
     }

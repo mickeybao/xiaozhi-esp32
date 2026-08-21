@@ -877,8 +877,10 @@ void Application::HandleTouchInteractionEvent() {
     if (IsRadioPlaying()) {
         ESP_LOGI(TAG, "Stopping radio from touchscreen interaction");
         StopRadioPlayback(false);
-        display->SetChatMessage("system", "网络收音机已停止，可以继续对话");
-        enter_listening();
+        display->SetChatMessage("system", "网络收音机已停止");
+        if (state == kDeviceStateListening) {
+            HandleStopListeningEvent();
+        }
         return;
     }
 
